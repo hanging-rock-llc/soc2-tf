@@ -1,6 +1,9 @@
 package plan
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 const samplePlan = `{
   "format_version": "1.2",
@@ -70,6 +73,30 @@ func TestNoChanges(t *testing.T) {
 	}
 	if f.HasChanges || len(f.Changes) != 0 {
 		t.Fatalf("expected no changes: %+v", f)
+	}
+}
+
+func TestValuesDigestCoversPlannedValuesNotPriorState(t *testing.T) {
+	parse := func(s string) *Facts {
+		t.Helper()
+		f, err := Parse([]byte(s))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	const tmpl = `{"format_version":"1.2","resource_changes":[{"address":"aws_security_group_rule.in","change":{"actions":["update"],"before":{"cidr":%q},"after":{"cidr":%q,"port":443}}}]}`
+	reviewed := parse(fmt.Sprintf(tmpl, "10.0.0.0/8", "10.0.0.0/16"))
+	drifted := parse(fmt.Sprintf(tmpl, "192.168.0.0/16", "10.0.0.0/16"))
+	opened := parse(fmt.Sprintf(tmpl, "10.0.0.0/8", "0.0.0.0/0"))
+	if reviewed.ChangesetDigest != opened.ChangesetDigest {
+		t.Fatal("changeset digest covers only address and action")
+	}
+	if reviewed.ValuesDigest == opened.ValuesDigest {
+		t.Fatal("a different planned value must change the values digest")
+	}
+	if reviewed.ValuesDigest != drifted.ValuesDigest {
+		t.Fatal("prior-state drift alone must not change the values digest")
 	}
 }
 

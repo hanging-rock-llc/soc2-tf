@@ -24,6 +24,9 @@ inputs:
   plan-json:
     description: Pre-rendered `show -json` output, relative to workdir (optional)
     default: ""
+  stack:
+    description: Name for this root module instance when one workdir is planned several ways (e.g. per var file). Default is the workdir plus the selected workspace.
+    default: ""
   exit-code:
     description: "capture-apply: exit code of terraform apply"
     default: ""
@@ -43,7 +46,7 @@ inputs:
     description: "verify: fail if no plan was captured on the merged pull request"
     default: "false"
   environment:
-    description: Deployment environment name to record (e.g. production)
+    description: "Deployment environment name (e.g. production). capture-apply only counts approvals of this environment."
     default: ""
   region:
     description: AWS region of the evidence bucket (default $AWS_REGION)
@@ -119,6 +122,7 @@ runs:
         TFPROOF_BINARY: ${{ inputs.binary }}
         TFPROOF_PLAN_FILE: ${{ inputs.plan-file }}
         TFPROOF_PLAN_JSON: ${{ inputs.plan-json }}
+        TFPROOF_STACK: ${{ inputs.stack }}
         TFPROOF_EXIT_CODE: ${{ inputs.exit-code }}
         TFPROOF_LOG: ${{ inputs.log }}
         TFPROOF_UPLOAD_LOG: ${{ inputs.upload-log }}

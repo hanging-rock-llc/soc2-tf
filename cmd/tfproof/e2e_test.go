@@ -19,12 +19,21 @@ import (
 	"github.com/hanging-rock-llc/soc2-tf/internal/record"
 )
 
-// fakeS3 is a path-style S3 stand-in that enforces the things tfproof relies
-// on: signed requests, sha256 checksums on PUT, and paginated listing.
+// fakeS3 is a path-style, versioned S3 stand-in that enforces the things
+// tfproof relies on: signed requests, sha256 checksums and If-None-Match on
+// PUT, NoSuchKey errors, and paginated version listing.
 type fakeS3 struct {
 	mu      sync.Mutex
-	objects map[string][]byte
+	objects map[string][][]byte // key -> versions, oldest first
 	puts    int
+}
+
+func (f *fakeS3) current(key string) ([]byte, bool) {
+	v := f.objects[key]
+	if len(v) == 0 {
+		return nil, false
+	}
+	return v[len(v)-1], true
 }
 
 func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -48,10 +57,14 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "BadDigest", http.StatusBadRequest)
 			return
 		}
-		f.objects[key] = body
+		if _, exists := f.current(key); exists && r.Header.Get("If-None-Match") == "*" {
+			http.Error(w, "PreconditionFailed", http.StatusPreconditionFailed)
+			return
+		}
+		f.objects[key] = append(f.objects[key], body)
 		f.puts++
 	case http.MethodGet:
-		if r.URL.Query().Get("list-type") == "2" {
+		if _, ok := r.URL.Query()["versions"]; ok {
 			prefix := r.URL.Query().Get("prefix")
 			var keys []string
 			for k := range f.objects {
@@ -61,29 +74,32 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			sort.Strings(keys)
 			start := 0
-			if tok := r.URL.Query().Get("continuation-token"); tok != "" {
-				fmt.Sscanf(tok, "%d", &start)
+			if m := r.URL.Query().Get("key-marker"); m != "" {
+				start = sort.SearchStrings(keys, m) + 1
 			}
 			end := start + 3 // small pages to exercise pagination
 			truncated := end < len(keys)
 			if end > len(keys) {
 				end = len(keys)
 			}
-			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult>`)
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult>`)
 			for _, k := range keys[start:end] {
-				fmt.Fprintf(w, "<Contents><Key>%s</Key></Contents>", k)
+				for i := range f.objects[k] {
+					fmt.Fprintf(w, "<Version><Key>%s</Key><VersionId>v%d</VersionId><IsLatest>%t</IsLatest></Version>", k, i, i == len(f.objects[k])-1)
+				}
 			}
 			if truncated {
-				fmt.Fprintf(w, "<IsTruncated>true</IsTruncated><NextContinuationToken>%d</NextContinuationToken>", end)
+				fmt.Fprintf(w, "<IsTruncated>true</IsTruncated><NextKeyMarker>%s</NextKeyMarker><NextVersionIdMarker>x</NextVersionIdMarker>", keys[end-1])
 			} else {
 				fmt.Fprint(w, "<IsTruncated>false</IsTruncated>")
 			}
-			fmt.Fprint(w, "</ListBucketResult>")
+			fmt.Fprint(w, "</ListVersionsResult>")
 			return
 		}
-		b, ok := f.objects[key]
+		b, ok := f.current(key)
 		if !ok {
-			http.Error(w, "NoSuchKey", http.StatusNotFound)
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, "<Error><Code>NoSuchKey</Code></Error>")
 			return
 		}
 		w.Write(b)
@@ -106,8 +122,11 @@ func fakeGitHub(t *testing.T) *httptest.Server {
 			{"user":{"login":"carol"},"state":"COMMENTED","commit_id":"headsha","submitted_at":"2026-11-20T13:00:00Z"}
 		]`)
 	})
+	mux.HandleFunc("/repos/acme/infra/pulls/7/commits", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"author":{"login":"alice"},"committer":{"login":"web-flow"}}]`)
+	})
 	mux.HandleFunc("/repos/acme/infra/commits/mergesha/pulls", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `[{"number":7,"merged_at":"2026-11-20T14:00:00Z"}]`)
+		fmt.Fprint(w, `[{"number":7,"merged_at":"2026-11-20T14:00:00Z","merge_commit_sha":"mergesha"}]`)
 	})
 	mux.HandleFunc("/repos/acme/infra/actions/runs/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/approvals") {
@@ -153,15 +172,18 @@ func setRun(t *testing.T, dir, runID, event, sha, eventJSON string) {
 	t.Setenv("GITHUB_STEP_SUMMARY", filepath.Join(dir, "summary-"+runID+".md"))
 }
 
-func TestEndToEnd(t *testing.T) {
-	dir := t.TempDir()
-	s3 := &fakeS3{objects: map[string][]byte{}}
+// e2eEnv starts fake S3, STS and GitHub, points tfproof at them, and returns
+// a workspace with plan fixtures in infra/prod.
+func e2eEnv(t *testing.T) (dir, wd string, s3 *fakeS3) {
+	t.Helper()
+	dir = t.TempDir()
+	s3 = &fakeS3{objects: map[string][][]byte{}}
 	s3srv := httptest.NewServer(s3)
-	defer s3srv.Close()
+	t.Cleanup(s3srv.Close)
 	gh := fakeGitHub(t)
-	defer gh.Close()
+	t.Cleanup(gh.Close)
 	sts := fakeSTS()
-	defer sts.Close()
+	t.Cleanup(sts.Close)
 
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIATEST")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
@@ -172,21 +194,29 @@ func TestEndToEnd(t *testing.T) {
 	t.Setenv("GITHUB_API_URL", gh.URL)
 	t.Setenv("GITHUB_TOKEN", "ghs_test")
 	t.Setenv("TFPROOF_SINK", "s3://evidence-bucket/tfproof")
+	t.Setenv("TF_WORKSPACE", "")
 
-	wd := filepath.Join(dir, "infra", "prod")
+	wd = filepath.Join(dir, "infra", "prod")
 	os.MkdirAll(wd, 0o755)
 	os.WriteFile(filepath.Join(wd, "plan.json"), []byte(planA), 0o644)
 	os.WriteFile(filepath.Join(wd, "evil.json"), []byte(planEvil), 0o644)
 	os.WriteFile(filepath.Join(wd, "tfplan"), []byte("binary-plan-A"), 0o644)
 	os.WriteFile(filepath.Join(wd, "tfplan-other"), []byte("binary-plan-B"), 0o644)
 	os.WriteFile(filepath.Join(wd, "apply.log"), []byte("Apply complete! Resources: 1 added, 1 changed, 0 destroyed."), 0o644)
+	return dir, wd, s3
+}
+
+const prEvent = `{"pull_request":{"number":7,"head":{"sha":"headsha"}}}`
+
+func TestEndToEnd(t *testing.T) {
+	dir, wd, s3 := e2eEnv(t)
 
 	// 1. Plan on the pull request.
-	setRun(t, dir, "444", "pull_request", "headsha", `{"pull_request":{"number":7}}`)
+	setRun(t, dir, "444", "pull_request", "prmergeref", prEvent)
 	if err := run([]string{"capture", "plan", "--workdir", wd, "--plan-json", "plan.json"}); err != nil {
 		t.Fatalf("capture plan (PR): %v", err)
 	}
-	if _, ok := s3.objects["tfproof/index/acme/infra/pr/7/infra__prod/plan.json"]; !ok {
+	if _, ok := s3.current("tfproof/index/acme/infra/pr/7/infra__prod/plan.json"); !ok {
 		t.Fatalf("PR index not written; objects: %v", keys(s3.objects))
 	}
 	summary, _ := os.ReadFile(filepath.Join(dir, "summary-444.md"))
@@ -196,6 +226,7 @@ func TestEndToEnd(t *testing.T) {
 
 	// 2. Merge -> push run: plan job, then gated apply job (same run).
 	setRun(t, dir, "555", "push", "mergesha", `{"ref":"refs/heads/main"}`)
+	t.Setenv("TFPROOF_ENVIRONMENT", "production")
 	if err := run([]string{"capture", "plan", "--workdir", wd, "--plan-json", "plan.json", "--plan-file", "tfplan"}); err != nil {
 		t.Fatalf("capture plan (push): %v", err)
 	}
@@ -220,25 +251,28 @@ func TestEndToEnd(t *testing.T) {
 
 	// Find and inspect the apply record.
 	var applyRec *record.Record
-	for k, v := range s3.objects {
-		if strings.HasPrefix(k, "tfproof/records/") && strings.Contains(k, "-apply-") {
+	applyKey := ""
+	for k := range s3.objects {
+		if strings.HasPrefix(k, "tfproof/records/apply/") {
+			v, _ := s3.current(k)
 			r, ok, err := record.VerifyContent(v)
 			if err != nil || !ok {
 				t.Fatalf("apply record content check failed: ok=%v err=%v", ok, err)
 			}
-			applyRec = r
+			applyRec, applyKey = r, k
 		}
 	}
 	if applyRec == nil {
 		t.Fatalf("no apply record; objects: %v", keys(s3.objects))
 	}
 	a := applyRec.Approval
-	if a == nil || strings.Join(a.ApprovedBy, ",") != "bob" || strings.Join(a.EnvironmentApprovedBy, ",") != "dave" || !a.IndependentApprover || !a.ApprovedHead {
+	if a == nil || strings.Join(a.ApprovedBy, ",") != "bob" || strings.Join(a.EnvironmentApprovedBy, ",") != "dave" ||
+		strings.Join(a.ChangeAuthors, ",") != "alice" || !a.IndependentApprover || !a.ApprovedHead || a.StaleApproval {
 		b, _ := json.MarshalIndent(applyRec.Approval, "", " ")
 		t.Fatalf("unexpected approval evidence: %s", b)
 	}
 	v := applyRec.Apply.Verification
-	if v == nil || !v.Passed || v.SameRun == nil || !*v.SameRun || v.PullRequest == nil || !*v.PullRequest {
+	if v == nil || !v.Passed || v.SameRun == nil || !*v.SameRun || v.PullRequest == nil || !*v.PullRequest || !strings.HasPrefix(v.PullRequestRecord, "444-") {
 		b, _ := json.MarshalIndent(v, "", " ")
 		t.Fatalf("unexpected verification: %s", b)
 	}
@@ -251,6 +285,14 @@ func TestEndToEnd(t *testing.T) {
 	if applyRec.Apply.LogSHA256 == "" || applyRec.Apply.LogKey != "" {
 		t.Fatalf("log should be hashed but not uploaded by default: %+v", applyRec.Apply)
 	}
+	// Records are write-once: capturing the same apply again must not replace it.
+	err = run([]string{"capture", "apply", "--workdir", wd, "--plan-json", "plan.json", "--exit-code", "1"})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("second capture of the same apply should fail, got %v", err)
+	}
+	if n := len(s3.objects[applyKey]); n != 1 {
+		t.Fatalf("apply record has %d versions, want 1", n)
+	}
 
 	// 3. A second apply with an unreviewed change set -> must show up as an exception.
 	setRun(t, dir, "666", "workflow_dispatch", "othersha", `{}`)
@@ -260,9 +302,15 @@ func TestEndToEnd(t *testing.T) {
 
 	// 4. Report.
 	out := filepath.Join(dir, "evidence")
-	if err := run([]string{"report", "--repo", "acme/infra", "--since", "2000-01-01", "--out-dir", out}); err != nil {
-		t.Fatalf("report: %v", err)
+	report := func() string {
+		t.Helper()
+		if err := run([]string{"report", "--repo", "acme/infra", "--since", "2000-01-01", "--out-dir", out}); err != nil {
+			t.Fatalf("report: %v", err)
+		}
+		md, _ := os.ReadFile(filepath.Join(out, "summary.md"))
+		return string(md)
 	}
+	md := report()
 	f, _ := os.Open(filepath.Join(out, "changes.csv"))
 	rows, err := csv.NewReader(f).ReadAll()
 	f.Close()
@@ -279,28 +327,48 @@ func TestEndToEnd(t *testing.T) {
 	if !strings.Contains(rows[2][exCol], "not verified") && !strings.Contains(rows[2][exCol], "did not match") {
 		t.Fatalf("second apply should be flagged, got %q", rows[2][exCol])
 	}
-	md, _ := os.ReadFile(filepath.Join(out, "summary.md"))
-	if !strings.Contains(string(md), "Applies with exceptions: **1**") {
-		t.Fatalf("summary missing exception count:\n%s", md)
+	if !strings.Contains(md, "Applies with exceptions: **1**") || !strings.Contains(md, "Plans captured: **2**") {
+		t.Fatalf("summary missing counts:\n%s", md)
 	}
 
-	// 5. Tampering with a stored record is detected.
-	for k, v := range s3.objects {
-		if strings.HasPrefix(k, "tfproof/records/") && strings.Contains(k, "555-1") && strings.Contains(k, "-apply-") {
-			s3.objects[k] = []byte(strings.Replace(string(v), `"exit_code": 0`, `"exit_code": 0 `, 1))
-			s3.objects[k] = []byte(strings.Replace(string(s3.objects[k]), `"bob"`, `"mallory"`, 1))
-		}
+	// 5. A new version written over a record (bypassing tfproof) is flagged,
+	// even though its content hash is self-consistent.
+	orig, _ := s3.current(applyKey)
+	forged, _, _ := record.VerifyContent(orig)
+	forged.Apply.ExitCode = 0
+	forged.Run.Actor = "mallory"
+	fb, _ := record.Finalize(forged)
+	s3.objects[applyKey] = append(s3.objects[applyKey], fb)
+	if md := report(); !strings.Contains(md, "record overwritten (2 versions)") || !strings.Contains(md, "Applies with exceptions: **2**") {
+		t.Fatalf("overwritten record not flagged:\n%s", md)
 	}
-	if err := run([]string{"report", "--repo", "acme/infra", "--since", "2000-01-01", "--out-dir", out}); err != nil {
-		t.Fatal(err)
-	}
-	md, _ = os.ReadFile(filepath.Join(out, "summary.md"))
-	if !strings.Contains(string(md), "content hash mismatch") {
+
+	// 6. Altered bytes are detected by the content hash.
+	s3.objects[applyKey] = [][]byte{[]byte(strings.Replace(string(orig), `"bob"`, `"mallory"`, 1))}
+	if md := report(); !strings.Contains(md, "content hash mismatch") {
 		t.Fatalf("tampered record not flagged:\n%s", md)
 	}
 }
 
-func keys(m map[string][]byte) []string {
+// A plan on main must not replace the plan reviewed on the PR: otherwise the
+// PR check compares main's plan with itself and always passes.
+func TestPushPlanDoesNotReplaceReviewedPRPlan(t *testing.T) {
+	dir, wd, _ := e2eEnv(t)
+	setRun(t, dir, "444", "pull_request", "prmergeref", prEvent)
+	if err := run([]string{"capture", "plan", "--workdir", wd, "--plan-json", "plan.json"}); err != nil {
+		t.Fatal(err)
+	}
+	setRun(t, dir, "555", "push", "mergesha", `{"ref":"refs/heads/main"}`)
+	if err := run([]string{"capture", "plan", "--workdir", wd, "--plan-json", "evil.json", "--plan-file", "tfplan"}); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"verify", "--workdir", wd, "--plan-json", "evil.json", "--plan-file", "tfplan", "--require-same-run", "--require-pr"})
+	if ee, ok := err.(exitError); !ok || ee.code != 2 {
+		t.Fatalf("main's plan differs from the one reviewed on PR #7; verify should exit 2, got %v", err)
+	}
+}
+
+func keys(m map[string][][]byte) []string {
 	var out []string
 	for k := range m {
 		out = append(out, k)

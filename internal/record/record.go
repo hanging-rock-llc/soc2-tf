@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -34,11 +35,16 @@ type Tool struct {
 	Version string `json:"version"`
 }
 
-// IaC describes the Terraform/OpenTofu root module.
+// IaC describes the Terraform/OpenTofu root module instance.
 type IaC struct {
 	Binary  string `json:"binary"`
 	Version string `json:"version,omitempty"`
 	Workdir string `json:"workdir"`
+	// Workspace is the selected Terraform/OpenTofu workspace ("" = default).
+	Workspace string `json:"workspace,omitempty"`
+	// Stack optionally names the unit explicitly (e.g. "prod-us-east-1") when
+	// one workdir is planned several ways, such as with different var files.
+	Stack string `json:"stack,omitempty"`
 }
 
 // PlanEvidence is what was proposed.
@@ -98,16 +104,7 @@ func WorkdirKey(workdir string) string {
 	if w == "" {
 		w = "root"
 	}
-	w = strings.ReplaceAll(w, "/", "__")
-	var b strings.Builder
-	for _, c := range w {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' {
-			b.WriteRune(c)
-		} else {
-			b.WriteByte('-')
-		}
-	}
-	return b.String()
+	return safe(strings.ReplaceAll(w, "/", "__"))
 }
 
 func safe(s string) string {
@@ -122,35 +119,50 @@ func safe(s string) string {
 	return b.String()
 }
 
-// NewID builds the record ID: <run_id>-<attempt>-<job>-<phase>-<workdir>.
-func NewID(run ghctx.Run, phase Phase, workdir string) string {
+// UnitKey identifies the root module instance a plan or apply belongs to:
+// the stack name if set, else the workdir, plus "@<workspace>" for a
+// non-default workspace. Plans of different units never match each other.
+func UnitKey(iac IaC) string {
+	k := WorkdirKey(iac.Workdir)
+	if iac.Stack != "" {
+		k = WorkdirKey(iac.Stack)
+	}
+	if iac.Workspace != "" && iac.Workspace != "default" {
+		k += "@" + safe(iac.Workspace)
+	}
+	return k
+}
+
+// NewID builds the record ID: <run_id>-<attempt>-<job>-<phase>-<unit>.
+func NewID(run ghctx.Run, phase Phase, unit string) string {
 	job := run.Job
 	if job == "" {
 		job = "job"
 	}
-	return fmt.Sprintf("%s-%s-%s-%s-%s", run.RunID, run.RunAttempt, safe(job), phase, WorkdirKey(workdir))
+	return fmt.Sprintf("%s-%s-%s-%s-%s", run.RunID, run.RunAttempt, safe(job), phase, unit)
 }
 
 // Key is the record's object key (relative to the sink prefix):
-// records/<owner>/<repo>/<yyyy>/<mm>/<dd>/<id>.json
+// records/<phase>/<owner>/<repo>/<yyyy>/<mm>/<dd>/<id>.json
+//
+// The phase comes first so IAM can let the plan role write only plan records
+// and the apply role only apply records.
 func Key(r *Record) string {
 	t := r.CapturedAt.UTC()
-	return path.Join("records", r.Run.Repository, t.Format("2006"), t.Format("01"), t.Format("02"), r.ID+".json")
+	return path.Join("records", string(r.Phase), r.Run.Repository, t.Format("2006"), t.Format("01"), t.Format("02"), r.ID+".json")
 }
 
-// RunIndexKey points at the latest plan record for a workdir in a run.
-func RunIndexKey(repo, runID, workdir string) string {
-	return path.Join("index", repo, "run", runID, WorkdirKey(workdir), "plan.json")
+// RunIndexKey points at the latest plan record for a unit in a run.
+func RunIndexKey(repo, runID, unit string) string {
+	return path.Join("index", repo, "run", runID, unit, "plan.json")
 }
 
-// PRIndexKey points at the latest plan record for a workdir on a PR.
-func PRIndexKey(repo string, pr int, workdir string) string {
-	return path.Join("index", repo, "pr", fmt.Sprint(pr), WorkdirKey(workdir), "plan.json")
+// PRIndexKey points at the latest plan record for a unit on a PR.
+func PRIndexKey(repo string, pr int, unit string) string {
+	return path.Join("index", repo, "pr", fmt.Sprint(pr), unit, "plan.json")
 }
 
-// compact encodes v as compact JSON without HTML escaping, so the bytes
-// match what `jq -c` produces and a record can be re-verified with standard
-// tools (see docs/record-schema.md).
+// compact encodes v as compact JSON without HTML escaping.
 func compact(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -161,39 +173,44 @@ func compact(v any) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
-// Finalize sets ContentSHA256 and returns the serialized record.
+// hashField matches the content hash, which is always the last field.
+var hashField = regexp.MustCompile(`"content_sha256":"[0-9a-f]*"}$`)
+
+const blankHash = `"content_sha256":""}`
+
+// Finalize sets ContentSHA256 and returns the serialized record: one line of
+// compact JSON plus a newline. The hash covers exactly the stored bytes with
+// the hash value blanked, so it can be re-checked with sed and sha256sum
+// (see docs/record-schema.md).
 func Finalize(r *Record) ([]byte, error) {
 	r.ContentSHA256 = ""
 	b, err := compact(r)
 	if err != nil {
 		return nil, err
 	}
+	if !bytes.HasSuffix(b, []byte(blankHash)) {
+		return nil, fmt.Errorf("record: content_sha256 must be the last field")
+	}
 	sum := sha256.Sum256(b)
 	r.ContentSHA256 = hex.EncodeToString(sum[:])
-	out, err := compact(r)
-	if err != nil {
-		return nil, err
-	}
-	var pretty bytes.Buffer
-	if err := json.Indent(&pretty, out, "", "  "); err != nil {
-		return nil, err
-	}
-	return pretty.Bytes(), nil
+	out := append(bytes.TrimSuffix(b, []byte(blankHash)), []byte(`"content_sha256":"`+r.ContentSHA256+`"}`+"\n")...)
+	return out, nil
 }
 
-// VerifyContent recomputes ContentSHA256 for a stored record.
+// VerifyContent checks a stored record's content hash against its bytes as
+// stored, so fields this version of tfproof doesn't know about are covered
+// too. Any change to the bytes, including whitespace, breaks the hash.
 func VerifyContent(data []byte) (*Record, bool, error) {
 	var r Record
 	if err := json.Unmarshal(data, &r); err != nil {
 		return nil, false, err
 	}
-	want := r.ContentSHA256
-	cp := r
-	cp.ContentSHA256 = ""
-	b, err := compact(&cp)
-	if err != nil {
-		return nil, false, err
+	b := bytes.TrimSuffix(data, []byte("\n"))
+	loc := hashField.FindIndex(b)
+	if loc == nil {
+		return &r, false, nil
 	}
-	sum := sha256.Sum256(b)
-	return &r, hex.EncodeToString(sum[:]) == want, nil
+	blanked := append(append([]byte{}, b[:loc[0]]...), blankHash...)
+	sum := sha256.Sum256(blanked)
+	return &r, r.ContentSHA256 != "" && hex.EncodeToString(sum[:]) == r.ContentSHA256, nil
 }
