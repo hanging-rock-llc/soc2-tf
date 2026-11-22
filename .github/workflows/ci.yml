@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: Build
+        run: CGO_ENABLED=0 go build -trimpath -o tfproof ./cmd/tfproof && ./tfproof version
+
+  terraform:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [evidence-bucket, state-audit-trail]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: fmt
+        run: terraform fmt -check -recursive terraform/
+      - name: validate
+        working-directory: terraform/modules/${{ matrix.module }}
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate

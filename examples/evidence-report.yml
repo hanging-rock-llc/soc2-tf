@@ -1,0 +1,42 @@
+# Example: build the auditor evidence pack monthly (or on demand) and attach
+# it to the run as an artifact.
+name: tfproof evidence report
+
+on:
+  schedule:
+    - cron: "17 6 1 * *"   # 06:17 UTC on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      since:
+        description: Start date (YYYY-MM-DD)
+        required: false
+      until:
+        description: End date, exclusive (YYYY-MM-DD)
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-tfproof-reader
+          aws-region: us-east-1
+          role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: hanging-rock-llc/soc2-tf@main
+        with:
+          command: report
+          sink: s3://acme-tf-evidence/tfproof
+          report-since: ${{ inputs.since }}
+          report-until: ${{ inputs.until }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfproof-evidence
+          path: tfproof-evidence/
+          retention-days: 90

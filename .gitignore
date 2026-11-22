@@ -1,0 +1,9 @@
+/tfproof
+/dist/
+/tfproof-evidence/
+*.tfplan
+tfplan
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*

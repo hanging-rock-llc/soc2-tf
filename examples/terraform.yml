@@ -1,0 +1,134 @@
+# Example: plan on pull requests, plan -> approval gate -> apply on merge,
+# with tfproof recording evidence at every step.
+#
+# Copy to .github/workflows/terraform.yml and adjust the env block.
+# Prereqs:
+#   - an evidence bucket (see terraform/modules/evidence-bucket)
+#   - GitHub OIDC roles: a read-only plan role and an apply role, both allowed
+#     to write to the evidence bucket (module output: writer_policy_json)
+#   - a "production" environment with required reviewers (Settings > Environments)
+name: terraform
+
+on:
+  pull_request:
+    paths: ["infra/**"]
+  push:
+    branches: [main]
+    paths: ["infra/**"]
+
+permissions:
+  id-token: write       # OIDC to AWS
+  contents: read
+  pull-requests: read   # tfproof: PR metadata and reviews
+  actions: read         # tfproof: deployment environment approvals
+
+env:
+  TF_WORKDIR: infra/prod
+  AWS_REGION: us-east-1
+  EVIDENCE: s3://acme-tf-evidence/tfproof
+  PLAN_ROLE: arn:aws:iam::123456789012:role/gha-terraform-plan
+  APPLY_ROLE: arn:aws:iam::123456789012:role/gha-terraform-apply
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.PLAN_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Ties every CloudTrail event to this exact run.
+          role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: terraform plan
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: |
+          terraform init -input=false
+          terraform plan -input=false -out=tfplan
+
+      - name: Record plan
+        uses: hanging-rock-llc/soc2-tf@main   # pin to a release tag or commit SHA
+        with:
+          command: capture-plan
+          sink: ${{ env.EVIDENCE }}
+          workdir: ${{ env.TF_WORKDIR }}
+          plan-file: tfplan
+
+      - name: Upload plan for the apply job
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKDIR }}/tfplan
+          retention-days: 5
+
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: production   # required reviewers approve here
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKDIR }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.APPLY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform init -input=false
+
+      # Gate: refuse to apply unless this is byte-for-byte the plan from the
+      # plan job, and its change set matches what was reviewed on the PR.
+      - name: Verify plan
+        uses: hanging-rock-llc/soc2-tf@main
+        with:
+          command: verify
+          sink: ${{ env.EVIDENCE }}
+          workdir: ${{ env.TF_WORKDIR }}
+          plan-file: tfplan
+          require-same-run: "true"
+          require-pr: "true"
+
+      - name: terraform apply
+        id: apply
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: |
+          set +e
+          terraform apply -input=false -no-color tfplan 2>&1 | tee apply.log
+          code=${PIPESTATUS[0]}
+          echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Record apply
+        if: always() && steps.apply.outcome != 'skipped'
+        uses: hanging-rock-llc/soc2-tf@main
+        with:
+          command: capture-apply
+          sink: ${{ env.EVIDENCE }}
+          workdir: ${{ env.TF_WORKDIR }}
+          plan-file: tfplan
+          exit-code: ${{ steps.apply.outputs.exit-code || '1' }}
+          log: ${{ env.TF_WORKDIR }}/apply.log
+          environment: production

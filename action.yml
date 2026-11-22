@@ -1,0 +1,143 @@
+name: tfproof
+description: Tamper-evident SOC 2 change evidence for Terraform and OpenTofu plans and applies
+author: Hanging Rock Consulting
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  command:
+    description: "capture-plan, verify, capture-apply, or report"
+    required: true
+  sink:
+    description: "Evidence store, e.g. s3://my-evidence-bucket/tfproof"
+    required: true
+  workdir:
+    description: Terraform/OpenTofu root module directory
+    default: "."
+  binary:
+    description: terraform or tofu
+    default: terraform
+  plan-file:
+    description: Binary plan file, relative to workdir
+    default: ""
+  plan-json:
+    description: Pre-rendered `show -json` output, relative to workdir (optional)
+    default: ""
+  exit-code:
+    description: "capture-apply: exit code of terraform apply"
+    default: ""
+  log:
+    description: "capture-apply: path to captured apply output"
+    default: ""
+  upload-log:
+    description: "capture-apply: also store the apply log (may contain sensitive output)"
+    default: "false"
+  pr:
+    description: "Pull request number, auto, or none"
+    default: auto
+  require-same-run:
+    description: "verify: fail if no plan was captured earlier in this run"
+    default: "false"
+  require-pr:
+    description: "verify: fail if no plan was captured on the merged pull request"
+    default: "false"
+  environment:
+    description: Deployment environment name to record (e.g. production)
+    default: ""
+  region:
+    description: AWS region of the evidence bucket (default $AWS_REGION)
+    default: ""
+  github-token:
+    description: Token used to read PR reviews and environment approvals
+    default: ${{ github.token }}
+  report-repo:
+    description: "report: owner/repo (default: this repository)"
+    default: ${{ github.repository }}
+  report-since:
+    description: "report: start date YYYY-MM-DD"
+    default: ""
+  report-until:
+    description: "report: end date YYYY-MM-DD (exclusive)"
+    default: ""
+  report-out-dir:
+    description: "report: output directory"
+    default: tfproof-evidence
+
+outputs:
+  record-id:
+    description: ID of the record written
+    value: ${{ steps.run.outputs.record-id }}
+  record-key:
+    description: Object key of the record written
+    value: ${{ steps.run.outputs.record-key }}
+  content-sha256:
+    description: Content hash of the record written
+    value: ${{ steps.run.outputs.content-sha256 }}
+  changeset-digest:
+    description: Digest of the planned change set
+    value: ${{ steps.run.outputs.changeset-digest }}
+  has-changes:
+    description: Whether the plan changes anything
+    value: ${{ steps.run.outputs.has-changes }}
+  verified:
+    description: "verify: whether the plan matched"
+    value: ${{ steps.run.outputs.verified }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      if: env.TFPROOF_BIN == ''
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: ${{ github.action_path }}/go.mod
+        cache: false
+
+    - name: Build tfproof
+      if: env.TFPROOF_BIN == ''
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        bin="$RUNNER_TEMP/tfproof"
+        (cd "$ACTION_PATH" && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${ACTION_REF:-dev}" -o "$bin" ./cmd/tfproof)
+        echo "TFPROOF_BIN=$bin" >> "$GITHUB_ENV"
+
+    # All inputs reach the binary as environment variables, never by
+    # interpolating them into the script, so untrusted values (branch names,
+    # PR titles) can't inject shell commands.
+    - name: Run tfproof
+      id: run
+      shell: bash
+      env:
+        CMD: ${{ inputs.command }}
+        TFPROOF_SINK: ${{ inputs.sink }}
+        TFPROOF_WORKDIR: ${{ inputs.workdir }}
+        TFPROOF_BINARY: ${{ inputs.binary }}
+        TFPROOF_PLAN_FILE: ${{ inputs.plan-file }}
+        TFPROOF_PLAN_JSON: ${{ inputs.plan-json }}
+        TFPROOF_EXIT_CODE: ${{ inputs.exit-code }}
+        TFPROOF_LOG: ${{ inputs.log }}
+        TFPROOF_UPLOAD_LOG: ${{ inputs.upload-log }}
+        TFPROOF_PR: ${{ inputs.pr }}
+        TFPROOF_REQUIRE_SAME_RUN: ${{ inputs.require-same-run }}
+        TFPROOF_REQUIRE_PR: ${{ inputs.require-pr }}
+        TFPROOF_ENVIRONMENT: ${{ inputs.environment }}
+        TFPROOF_REGION: ${{ inputs.region }}
+        TFPROOF_GITHUB_TOKEN: ${{ inputs.github-token }}
+        TFPROOF_REPO: ${{ inputs.report-repo }}
+        TFPROOF_SINCE: ${{ inputs.report-since }}
+        TFPROOF_UNTIL: ${{ inputs.report-until }}
+        TFPROOF_OUT_DIR: ${{ inputs.report-out-dir }}
+      run: |
+        set -euo pipefail
+        case "$CMD" in
+          capture-plan)  exec "$TFPROOF_BIN" capture plan ;;
+          capture-apply) exec "$TFPROOF_BIN" capture apply ;;
+          verify)        exec "$TFPROOF_BIN" verify ;;
+          report)        exec "$TFPROOF_BIN" report ;;
+          *) echo "::error title=tfproof::unknown command '$CMD' (want capture-plan, verify, capture-apply, report)"; exit 1 ;;
+        esac
