@@ -3,6 +3,8 @@ locals {
   kms_key_arn    = local.create_kms_key ? aws_kms_key.evidence[0].arn : var.kms_key_arn
   bucket_arn     = aws_s3_bucket.evidence.arn
   lifecycle_on   = var.glacier_transition_days != null || var.expire_after_days != null
+  # ARN prefix for everything tfproof writes, e.g. arn:aws:s3:::bucket/tfproof/
+  evidence_arn = var.evidence_prefix == "" ? "${local.bucket_arn}/" : "${local.bucket_arn}/${var.evidence_prefix}/"
 }
 
 resource "aws_kms_key" "evidence" {
@@ -116,6 +118,13 @@ resource "aws_s3_bucket_lifecycle_configuration" "evidence" {
     }
   }
 
+  lifecycle {
+    precondition {
+      condition     = var.expire_after_days == null || var.expire_after_days > var.retention_days
+      error_message = "expire_after_days must be greater than retention_days, or records would expire while still under retention."
+    }
+  }
+
   depends_on = [aws_s3_bucket_versioning.evidence]
 }
 
@@ -161,6 +170,28 @@ data "aws_iam_policy_document" "bucket" {
     }
   }
 
+  # Records are written once. tfproof creates them with If-None-Match: *, so
+  # S3 refuses to put a new version over an existing record; this makes that
+  # mandatory for everyone, including the CI roles. (Index objects under
+  # index/ are meant to be replaced and are not covered.)
+  statement {
+    sid       = "RecordsAreWriteOnce"
+    effect    = "Deny"
+    actions   = ["s3:PutObject"]
+    resources = ["${local.evidence_arn}records/*"]
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "Null"
+      variable = "s3:if-none-match"
+      values   = ["true"]
+    }
+  }
+
   # Evidence is never deleted by hand. Object Lock already blocks deleting
   # locked versions; this also stops anyone (root included) from adding
   # delete markers that would hide records. Changing it requires editing this
@@ -188,16 +219,58 @@ resource "aws_s3_bucket_policy" "evidence" {
   depends_on = [aws_s3_bucket_public_access_block.evidence]
 }
 
-# Attach to your CI plan and apply roles.
-data "aws_iam_policy_document" "writer" {
+# Attach to the CI role that runs `terraform plan` (pull requests and main).
+# It may write plan records and the indexes, but not apply records: a pull
+# request can change its own workflow file and use this role, so it must not
+# be able to forge evidence of an apply.
+data "aws_iam_policy_document" "plan_writer" {
   statement {
-    sid = "WriteEvidence"
-    actions = [
-      "s3:PutObject",
-      "s3:PutObjectRetention",
-      "s3:GetObject",
-    ]
-    resources = ["${local.bucket_arn}/*"]
+    sid       = "WritePlanEvidence"
+    actions   = ["s3:PutObject", "s3:PutObjectRetention"]
+    resources = ["${local.evidence_arn}records/plan/*", "${local.evidence_arn}index/*"]
+  }
+
+  statement {
+    sid       = "ReadEvidence"
+    actions   = ["s3:GetObject"]
+    resources = ["${local.evidence_arn}*"]
+  }
+
+  # Without ListBucket, S3 answers 403 instead of 404 for a missing key, and
+  # tfproof can't tell "no plan captured yet" from "access denied".
+  statement {
+    sid       = "ListEvidence"
+    actions   = ["s3:ListBucket"]
+    resources = [local.bucket_arn]
+  }
+
+  statement {
+    sid       = "UseEvidenceKey"
+    actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
+    resources = [local.kms_key_arn]
+  }
+}
+
+# Attach to the CI role that runs `terraform apply` (ideally only assumable
+# from the protected deployment environment). It writes apply records and
+# reads the indexes to verify the plan.
+data "aws_iam_policy_document" "apply_writer" {
+  statement {
+    sid       = "WriteApplyEvidence"
+    actions   = ["s3:PutObject", "s3:PutObjectRetention"]
+    resources = ["${local.evidence_arn}records/apply/*"]
+  }
+
+  statement {
+    sid       = "ReadEvidence"
+    actions   = ["s3:GetObject"]
+    resources = ["${local.evidence_arn}*"]
+  }
+
+  statement {
+    sid       = "ListEvidence"
+    actions   = ["s3:ListBucket"]
+    resources = [local.bucket_arn]
   }
 
   statement {

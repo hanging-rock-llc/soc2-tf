@@ -43,6 +43,17 @@ variable "expire_after_days" {
   default     = null
 }
 
+variable "evidence_prefix" {
+  description = "Key prefix tfproof writes under (the path part of the sink URI, e.g. \"tfproof\" for s3://bucket/tfproof). Write permissions and the create-only rule are scoped to it."
+  type        = string
+  default     = "tfproof"
+
+  validation {
+    condition     = !startswith(var.evidence_prefix, "/") && !endswith(var.evidence_prefix, "/")
+    error_message = "evidence_prefix must not start or end with a slash."
+  }
+}
+
 variable "writer_principal_arns" {
   description = "IAM role ARNs (your CI plan/apply roles) allowed to write evidence. Used in the bucket policy as the only principals that may PutObject."
   type        = list(string)

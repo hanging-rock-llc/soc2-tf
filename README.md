@@ -2,13 +2,13 @@
 
 **SOC 2 change-management evidence for Terraform and OpenTofu on GitHub Actions. You don't need a TACO for it.**
 
-If your Terraform already runs in GitHub Actions with OIDC and S3 state, you're most of the way to passing a SOC 2 change-management audit. What's missing is the evidence: a tamper-proof record, for every production apply, of what changed, who approved it, whether that approver was independent of the author, and proof that what got applied is what got approved.
+If your Terraform already runs in GitHub Actions with OIDC and S3 state, you're most of the way to passing a SOC 2 change-management audit. What's missing is the evidence: a tamper-evident record, for every production apply, of what changed, who approved it, whether that approver was independent of the author, and proof that what got applied is what got approved.
 
 The usual way to get that is a Terraform Cloud-style platform priced for enterprises. `tfproof` is the missing piece by itself:
 
 - **Captures** every plan and apply as a JSON record: the change set, the PR, the reviewers, the deployment-environment approvers, the AWS role session that ran it, and the exit code.
-- **Verifies** before apply that the plan being applied is byte-for-byte the plan from earlier in the run, and that its change set matches what was reviewed on the pull request. If not, it fails the job.
-- **Stores** records in **your** S3 bucket with Object Lock, so nobody (including you) can edit or delete them.
+- **Verifies** before apply that the plan being applied is byte-for-byte the plan from earlier in the run, and that its planned changes (resources, actions and resulting values) match the last plan of the pull request's final commit. If not, it fails the job.
+- **Stores** records write-once in **your** S3 bucket with Object Lock: a record can't be overwritten or deleted, and the report flags any record whose version history says otherwise.
 - **Reports**: one command produces the change population (`changes.csv`) and an exceptions summary (`summary.md`) for your auditor.
 
 It does not run Terraform, read your state, or hold credentials for your infrastructure. It's a single Go binary with **zero third-party dependencies**, and there's no server and no SaaS.
@@ -41,19 +41,22 @@ module "tf_evidence" {
   source = "github.com/hanging-rock-llc/soc2-tf//terraform/modules/evidence-bucket"
 
   bucket_name           = "acme-tf-evidence"
+  evidence_prefix       = "tfproof" # the path in s3://acme-tf-evidence/tfproof
   retention_mode        = "GOVERNANCE" # switch to COMPLIANCE once you're happy
   retention_days        = 400
   writer_principal_arns = [aws_iam_role.gha_plan.arn, aws_iam_role.gha_apply.arn]
 }
 
+# The plan role can write plan records and indexes; only the apply role can
+# write apply records.
 resource "aws_iam_role_policy" "plan_writes_evidence" {
   role   = aws_iam_role.gha_plan.id
-  policy = module.tf_evidence.writer_policy_json
+  policy = module.tf_evidence.plan_writer_policy_json
 }
 
 resource "aws_iam_role_policy" "apply_writes_evidence" {
   role   = aws_iam_role.gha_apply.id
-  policy = module.tf_evidence.writer_policy_json
+  policy = module.tf_evidence.apply_writer_policy_json
 }
 
 # Optional: CloudTrail data events for every read/write of your state bucket.
@@ -93,19 +96,22 @@ permissions:
     require-same-run: "true"
     require-pr: "true"
 
-# ...after terraform apply (always)
+# ...after terraform apply (always, unless apply was skipped because verify failed)
 - uses: hanging-rock-llc/soc2-tf@<commit-sha>
-  if: always()
+  if: always() && steps.apply.outcome != 'skipped'
   with:
     command: capture-apply
     sink: s3://acme-tf-evidence/tfproof
     workdir: infra/prod
     plan-file: tfplan
-    exit-code: ${{ steps.apply.outputs.exit-code }}
+    exit-code: ${{ steps.apply.outputs.exit-code || '1' }}
     log: infra/prod/apply.log
+    environment: production   # only approvals of this environment count
 ```
 
 Set `role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}` on `aws-actions/configure-aws-credentials` so each CloudTrail event traces back to a single run.
+
+Records are keyed by workdir and Terraform workspace. If one workdir is planned more than one way in the same run (for example once per var file), give each a distinct `stack:` so their plans aren't compared with each other.
 
 ### 3. Generate the evidence pack
 
@@ -119,17 +125,17 @@ Or schedule it: [`examples/evidence-report.yml`](examples/evidence-report.yml).
 `summary.md` flags any apply that had:
 
 - no recorded approval
-- no approver independent of the author
-- a PR approval on an older commit (with no environment approval after it)
+- no approver independent of the change's authors (the PR author and everyone who authored or pushed its commits; bots don't count)
+- a PR approval on an older commit with no independent environment approval after it
 - a plan that wasn't verified against, or didn't match, the reviewed plan
-- a record whose content hash doesn't match (tampering)
+- a record whose content hash doesn't match, that was overwritten, or that is stored under the wrong key
 
 ## CLI
 
 ```
-tfproof capture plan   --sink S --workdir D (--plan-file F | --plan-json J) [--binary tofu]
-tfproof verify         --sink S --workdir D --plan-file F [--require-same-run] [--require-pr] [--pr auto|N|none]
-tfproof capture apply  --sink S --workdir D --plan-file F --exit-code N [--log L] [--upload-log]
+tfproof capture plan   --sink S --workdir D (--plan-file F | --plan-json J) [--binary tofu] [--stack N]
+tfproof verify         --sink S --workdir D --plan-file F [--stack N] [--require-same-run] [--require-pr] [--pr auto|N|none]
+tfproof capture apply  --sink S --workdir D --plan-file F --exit-code N [--stack N] [--log L] [--upload-log]
 tfproof report         --sink S [--repo owner/repo] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--out-dir D]
 ```
 
@@ -156,9 +162,11 @@ AWS credentials come from the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_
 
 | Pattern | Verification |
 |---|---|
-| Plan job → environment gate → apply job in one run (recommended) | `same_run_match` (exact plan file) + `pull_request_match` (change set) |
+| Plan job → environment gate → apply job in one run (recommended) | `same_run_match` (exact plan file) + `pull_request_match` (planned values) |
 | Plan and apply in one job after merge | `pull_request_match` |
 | `workflow_dispatch` / manual | Environment approvals; no PR, so verification relies on same-run plans |
+
+`pull_request_match` compares against the plan captured on a `pull_request` event for the PR's final commit. Require branches to be up to date before merging; otherwise main's plan includes changes the PR's plan didn't, and verification fails until the PR is re-planned.
 
 The action is a thin wrapper around the binary. Other CI systems can call the binary directly, but pull request and approval evidence is only collected inside GitHub Actions for now.
 

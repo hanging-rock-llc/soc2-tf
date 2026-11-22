@@ -108,9 +108,9 @@ func envInt(name string, def int) int {
 }
 
 type common struct {
-	sink, region, workdir, binary, planFile, planJSON, pr, token, lockMode string
-	retainDays                                                             int
-	noAWS, noGitHub                                                        bool
+	sink, region, workdir, binary, planFile, planJSON, pr, token, lockMode, stack string
+	retainDays                                                                    int
+	noAWS, noGitHub                                                               bool
 }
 
 func (c *common) register(fs *flag.FlagSet) {
@@ -120,12 +120,38 @@ func (c *common) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.binary, "binary", envDefault("binary", "terraform"), "terraform or tofu")
 	fs.StringVar(&c.planFile, "plan-file", envDefault("plan_file", ""), "binary plan file (relative to --workdir)")
 	fs.StringVar(&c.planJSON, "plan-json", envDefault("plan_json", ""), "pre-rendered `show -json` output (skips running the binary)")
+	fs.StringVar(&c.stack, "stack", envDefault("stack", ""), "name for this root module instance when one workdir is planned several ways (e.g. per var file); default: workdir + workspace")
 	fs.StringVar(&c.pr, "pr", envDefault("pr", "auto"), "pull request number, auto, or none")
 	fs.StringVar(&c.token, "github-token", firstNonEmpty(os.Getenv("TFPROOF_GITHUB_TOKEN"), os.Getenv("GITHUB_TOKEN")), "token for reading PR reviews and environment approvals")
 	fs.IntVar(&c.retainDays, "retain-days", envInt("retain_days", 0), "explicit per-object Object Lock retention (0 = bucket default)")
 	fs.StringVar(&c.lockMode, "lock-mode", envDefault("lock_mode", "COMPLIANCE"), "Object Lock mode when --retain-days is set")
 	fs.BoolVar(&c.noAWS, "no-aws-identity", envBool("no_aws_identity"), "don't call sts:GetCallerIdentity")
 	fs.BoolVar(&c.noGitHub, "no-github-api", envBool("no_github_api"), "don't call the GitHub API")
+}
+
+// iac describes the root module instance being planned or applied.
+func (c *common) iac() record.IaC {
+	return record.IaC{Binary: c.binary, Workdir: relWorkdir(c.workdir), Workspace: workspace(c.workdir), Stack: c.stack}
+}
+
+// workspace returns the selected Terraform/OpenTofu workspace, or "" for
+// default: $TF_WORKSPACE, else the name `workspace select` stored in the
+// data directory.
+func workspace(workdir string) string {
+	ws := os.Getenv("TF_WORKSPACE")
+	if ws == "" {
+		dataDir := firstNonEmpty(os.Getenv("TF_DATA_DIR"), ".terraform")
+		if !filepath.IsAbs(dataDir) {
+			dataDir = filepath.Join(workdir, dataDir)
+		}
+		if b, err := os.ReadFile(filepath.Join(dataDir, "environment")); err == nil {
+			ws = strings.TrimSpace(string(b))
+		}
+	}
+	if ws == "default" {
+		return ""
+	}
+	return ws
 }
 
 func firstNonEmpty(v ...string) string {
@@ -180,7 +206,7 @@ func (c *common) resolvePR(gh *ghctx.Client, run ghctx.Run) (int, string) {
 	case "none", "0", "":
 		return 0, ""
 	case "auto":
-		if n := ghctx.PRNumberFromEvent(); n > 0 {
+		if n, _ := ghctx.PRFromEvent(); n > 0 {
 			return n, ""
 		}
 		if gh != nil && run.SHA != "" && run.Provider == "github-actions" {
@@ -212,8 +238,10 @@ func (c *common) github() *ghctx.Client {
 func relWorkdir(w string) string {
 	if ws := os.Getenv("GITHUB_WORKSPACE"); ws != "" {
 		if abs, err := filepath.Abs(w); err == nil {
-			if rel, err := filepath.Rel(ws, abs); err == nil && !strings.HasPrefix(rel, "..") {
-				return filepath.ToSlash(rel)
+			if rel, err := filepath.Rel(ws, abs); err == nil {
+				if rel = filepath.ToSlash(rel); rel != ".." && !strings.HasPrefix(rel, "../") {
+					return rel
+				}
 			}
 		}
 	}
@@ -239,16 +267,16 @@ func cmdCapture(phase record.Phase, args []string) error {
 	}
 
 	run := ghctx.FromEnv()
-	workdir := relWorkdir(c.workdir)
 	rec := &record.Record{
 		Schema:     record.Schema,
 		Phase:      phase,
 		CapturedAt: time.Now().UTC(),
 		Tool:       record.Tool{Name: "tfproof", Version: version},
-		IaC:        record.IaC{Binary: c.binary, Workdir: workdir},
+		IaC:        c.iac(),
 		Run:        run,
 	}
-	rec.ID = record.NewID(run, phase, workdir)
+	unit := record.UnitKey(rec.IaC)
+	rec.ID = record.NewID(run, phase, unit)
 
 	// Plan facts. For apply, the plan is optional but strongly recommended:
 	// it's what lets the record say *what* changed and verify it.
@@ -275,6 +303,7 @@ func cmdCapture(phase record.Phase, args []string) error {
 		pr, err := gh.GetPR(run.Repository, prNum)
 		if err != nil {
 			rec.Warnings = append(rec.Warnings, "pull request lookup failed: "+err.Error())
+			rec.PullRequest = &ghctx.PR{Number: prNum}
 		} else {
 			rec.PullRequest = pr
 		}
@@ -285,17 +314,22 @@ func cmdCapture(phase record.Phase, args []string) error {
 	if phase == record.PhaseApply {
 		// Approvals: PR reviews plus deployment environment approvals.
 		if gh != nil {
-			var reviews []ghctx.Review
-			if rec.PullRequest != nil && rec.PullRequest.Number > 0 {
-				if reviews, err = gh.Reviews(run.Repository, rec.PullRequest.Number); err != nil {
+			in := ghctx.ApprovalInput{PR: rec.PullRequest, Environment: run.Environment, Actor: run.Actor}
+			if n := prNumber(rec); n > 0 {
+				if in.Reviews, err = gh.Reviews(run.Repository, n); err != nil {
 					rec.Warnings = append(rec.Warnings, "PR reviews lookup failed: "+err.Error())
 				}
+				if in.CommitAuthors, err = gh.CommitAuthors(run.Repository, n); err != nil {
+					rec.Warnings = append(rec.Warnings, "PR commit authors lookup failed (only the PR author is treated as an author): "+err.Error())
+				}
 			}
-			env, err := gh.EnvApprovals(run.Repository, run.RunID)
-			if err != nil {
+			if in.EnvApprovals, err = gh.EnvApprovals(run.Repository, run.RunID); err != nil {
 				rec.Warnings = append(rec.Warnings, "environment approvals lookup failed (needs actions: read): "+err.Error())
 			}
-			a := ghctx.Evaluate(rec.PullRequest, reviews, env, run.Actor)
+			if run.Environment == "" {
+				rec.Warnings = append(rec.Warnings, "environment not set: approvals of any deployment environment in this run were counted (set the environment input)")
+			}
+			a := ghctx.Evaluate(in)
 			rec.Approval = &a
 		}
 		ae := &record.ApplyEvidence{ExitCode: *exitCode, Succeeded: *exitCode == 0}
@@ -307,17 +341,21 @@ func cmdCapture(phase record.Phase, args []string) error {
 				ae.LogSHA256 = awsv4.HashHex(b)
 				if *uploadLog {
 					ae.LogKey = strings.TrimSuffix(record.Key(rec), ".json") + ".log"
-					if err := s.Put(ae.LogKey, b, "text/plain; charset=utf-8"); err != nil {
+					if err := s.Create(ae.LogKey, b, "text/plain; charset=utf-8"); err != nil {
 						return fmt.Errorf("upload apply log: %w", err)
 					}
 				}
 			}
 		}
 		if rec.Plan != nil {
-			v, err := verify.Check(s, verify.Input{
-				Repo: run.Repository, RunID: run.RunID, Workdir: workdir,
+			in := verify.Input{
+				Repo: run.Repository, RunID: run.RunID, Unit: unit,
 				FileHash: fileHash, Facts: facts, PR: prNumber(rec),
-			})
+			}
+			if rec.PullRequest != nil {
+				in.PRHeadSHA = rec.PullRequest.HeadSHA
+			}
+			v, err := verify.Check(s, in)
 			if err != nil {
 				rec.Warnings = append(rec.Warnings, "verification could not run: "+err.Error())
 			} else {
@@ -343,15 +381,22 @@ func cmdCapture(phase record.Phase, args []string) error {
 		return err
 	}
 	key := record.Key(rec)
-	if err := s.Put(key, data, "application/json"); err != nil {
+	if err := s.Create(key, data, "application/json"); err != nil {
+		if errors.Is(err, sink.ErrExists) {
+			return fmt.Errorf("write record: %w (one capture per job, phase and unit; use --stack to tell units apart)", err)
+		}
 		return fmt.Errorf("write record: %w", err)
 	}
 	if phase == record.PhasePlan {
-		if err := s.Put(record.RunIndexKey(run.Repository, run.RunID, workdir), data, "application/json"); err != nil {
+		if err := s.Put(record.RunIndexKey(run.Repository, run.RunID, unit), data, "application/json"); err != nil {
 			return fmt.Errorf("write run index: %w", err)
 		}
-		if n := prNumber(rec); n > 0 {
-			if err := s.Put(record.PRIndexKey(run.Repository, n, workdir), data, "application/json"); err != nil {
+		// Only a plan of the pull request itself is evidence of what was
+		// reviewed. A push-to-main plan that merely resolves to a merged PR
+		// must not replace it, or the PR check would compare main's plan
+		// with itself.
+		if evNum, _ := ghctx.PRFromEvent(); run.Event == "pull_request" && run.PRHeadSHA != "" && evNum > 0 && evNum == prNumber(rec) {
+			if err := s.Put(record.PRIndexKey(run.Repository, evNum, unit), data, "application/json"); err != nil {
 				return fmt.Errorf("write PR index: %w", err)
 			}
 		}
@@ -359,10 +404,7 @@ func cmdCapture(phase record.Phase, args []string) error {
 
 	fmt.Printf("tfproof: recorded %s %s -> %s/%s\n", phase, rec.ID, s, key)
 	for _, w := range rec.Warnings {
-		fmt.Fprintln(os.Stderr, "tfproof: warning:", w)
-		if run.Provider == "github-actions" {
-			fmt.Printf("::warning title=tfproof::%s\n", w)
-		}
+		warning(run, w)
 	}
 	writeOutputs(map[string]string{
 		"record-id":        rec.ID,
@@ -376,6 +418,21 @@ func cmdCapture(phase record.Phase, args []string) error {
 		fmt.Println("::warning title=tfproof::applied plan was not verified against the reviewed plan; this apply will appear as an exception in the evidence report")
 	}
 	return nil
+}
+
+// warning prints w to stderr and, in GitHub Actions, as an annotation. The
+// message is escaped so text from API errors or terraform output can't
+// smuggle in further workflow commands.
+func warning(run ghctx.Run, w string) {
+	fmt.Fprintln(os.Stderr, "tfproof: warning:", w)
+	if run.Provider == "github-actions" {
+		fmt.Printf("::warning title=tfproof::%s\n", escapeData(w))
+	}
+}
+
+// escapeData escapes a workflow command message the way @actions/core does.
+func escapeData(s string) string {
+	return strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A").Replace(s)
 }
 
 func prNumber(r *record.Record) int {
@@ -410,15 +467,24 @@ func cmdVerify(args []string) error {
 	if err != nil {
 		return err
 	}
-	prNum, warn := c.resolvePR(c.github(), run)
+	gh := c.github()
+	prNum, warn := c.resolvePR(gh, run)
 	if warn != "" {
-		fmt.Fprintln(os.Stderr, "tfproof: warning:", warn)
+		warning(run, warn)
 	}
-	v, err := verify.Check(s, verify.Input{
-		Repo: run.Repository, RunID: run.RunID, Workdir: relWorkdir(c.workdir),
+	in := verify.Input{
+		Repo: run.Repository, RunID: run.RunID, Unit: record.UnitKey(c.iac()),
 		FileHash: fileHash, Facts: facts, PR: prNum,
 		RequireSameRun: *requireSameRun, RequirePR: *requirePR,
-	})
+	}
+	if gh != nil && prNum > 0 {
+		if pr, err := gh.GetPR(run.Repository, prNum); err != nil {
+			warning(run, "pull request lookup failed: "+err.Error())
+		} else {
+			in.PRHeadSHA = pr.HeadSHA
+		}
+	}
+	v, err := verify.Check(s, in)
 	if err != nil {
 		return err
 	}

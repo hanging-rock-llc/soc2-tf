@@ -1,4 +1,4 @@
-// Package s3 is a minimal S3 client (PutObject, GetObject, ListObjectsV2)
+// Package s3 is a minimal S3 client (PutObject, GetObject, ListObjectVersions)
 // built on the standard library and the awsv4 signer.
 package s3
 
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/hanging-rock-llc/soc2-tf/internal/awsv4"
+	"github.com/hanging-rock-llc/soc2-tf/internal/httpretry"
 )
 
 // Client talks to a single bucket.
@@ -31,8 +32,13 @@ type Client struct {
 	Now      func() time.Time
 }
 
-// ErrNotFound is returned by Get when the key does not exist.
-var ErrNotFound = errors.New("s3: object not found")
+var (
+	// ErrNotFound is returned by Get when the key does not exist.
+	ErrNotFound = errors.New("s3: object not found")
+	// ErrPreconditionFailed is returned by a create-only Put when the key
+	// already exists.
+	ErrPreconditionFailed = errors.New("s3: object already exists")
+)
 
 // New builds a client using environment credentials and region.
 func New(bucket, region string) (*Client, error) {
@@ -77,26 +83,26 @@ func (c *Client) objectURL(key string, q url.Values) *url.URL {
 	return u
 }
 
+// do signs and sends a request, retrying transient failures. Each attempt is
+// re-signed so the signature's timestamp stays fresh.
 func (c *Client) do(method string, u *url.URL, body []byte, hdr http.Header) (*http.Response, error) {
-	req, err := http.NewRequest(method, u.String(), bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	for k, v := range hdr {
-		req.Header[k] = v
-	}
 	payloadHash := awsv4.HashHex(body)
-	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 	now := time.Now
 	if c.Now != nil {
 		now = c.Now
 	}
-	awsv4.Sign(req, c.Creds, c.Region, "s3", payloadHash, now())
-	hc := c.HTTP
-	if hc == nil {
-		hc = http.DefaultClient
-	}
-	return hc.Do(req)
+	return httpretry.Do(c.HTTP, func() (*http.Request, error) {
+		req, err := http.NewRequest(method, u.String(), bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range hdr {
+			req.Header[k] = v
+		}
+		req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+		awsv4.Sign(req, c.Creds, c.Region, "s3", payloadHash, now())
+		return req, nil
+	})
 }
 
 // PutOptions controls optional per-object settings.
@@ -106,6 +112,9 @@ type PutOptions struct {
 	// object in addition to the bucket default.
 	RetainUntil time.Time
 	LockMode    string // GOVERNANCE or COMPLIANCE; default COMPLIANCE when RetainUntil set
+	// IfNoneMatch makes the write create-only: S3 rejects it with 412 if the
+	// key already has a current version.
+	IfNoneMatch bool
 }
 
 // Put uploads body to key. It always sends an x-amz-checksum-sha256 so S3
@@ -119,6 +128,9 @@ func (c *Client) Put(key string, body []byte, opt PutOptions) error {
 	}
 	h.Set("Content-Type", ct)
 	h.Set("X-Amz-Checksum-Sha256", base64.StdEncoding.EncodeToString(sum[:]))
+	if opt.IfNoneMatch {
+		h.Set("If-None-Match", "*")
+	}
 	if !opt.RetainUntil.IsZero() {
 		mode := opt.LockMode
 		if mode == "" {
@@ -132,6 +144,9 @@ func (c *Client) Put(key string, body []byte, opt PutOptions) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if opt.IfNoneMatch && resp.StatusCode == http.StatusPreconditionFailed {
+		return ErrPreconditionFailed
+	}
 	if resp.StatusCode/100 != 2 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("s3 put %s: %s: %s", key, resp.Status, strings.TrimSpace(string(b)))
@@ -139,19 +154,20 @@ func (c *Client) Put(key string, body []byte, opt PutOptions) error {
 	return nil
 }
 
-// Get downloads key.
+// Get downloads the current version of key. A missing key is ErrNotFound; a
+// missing bucket is an error, not "not found".
 func (c *Client) Get(key string) ([]byte, error) {
 	resp, err := c.do(http.MethodGet, c.objectURL(key, nil), nil, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrNotFound
-	}
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound && errorCode(b) != "NoSuchBucket" {
+		return nil, ErrNotFound
 	}
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("s3 get %s: %s: %s", key, resp.Status, strings.TrimSpace(string(b)))
@@ -159,27 +175,62 @@ func (c *Client) Get(key string) ([]byte, error) {
 	return b, nil
 }
 
-type listResult struct {
-	Contents []struct {
-		Key string `xml:"Key"`
-	} `xml:"Contents"`
-	IsTruncated           bool   `xml:"IsTruncated"`
-	NextContinuationToken string `xml:"NextContinuationToken"`
+func errorCode(body []byte) string {
+	var e struct {
+		Code string `xml:"Code"`
+	}
+	if xml.Unmarshal(body, &e) != nil {
+		return ""
+	}
+	return e.Code
 }
 
-// List returns all keys under prefix (paginating as needed).
-func (c *Client) List(prefix string) ([]string, error) {
-	var keys []string
-	token := ""
+// ObjectVersions summarizes the version history of one key.
+type ObjectVersions struct {
+	Key           string
+	Versions      int  // object versions (excluding delete markers)
+	DeleteMarkers int  // delete markers
+	Deleted       bool // the current version is a delete marker
+}
+
+type versionsResult struct {
+	Versions []struct {
+		Key      string `xml:"Key"`
+		IsLatest bool   `xml:"IsLatest"`
+	} `xml:"Version"`
+	DeleteMarkers []struct {
+		Key      string `xml:"Key"`
+		IsLatest bool   `xml:"IsLatest"`
+	} `xml:"DeleteMarker"`
+	IsTruncated         bool   `xml:"IsTruncated"`
+	NextKeyMarker       string `xml:"NextKeyMarker"`
+	NextVersionIDMarker string `xml:"NextVersionIdMarker"`
+}
+
+// ListVersions returns every key under prefix with its version counts, in key
+// order (paginating as needed). Keys hidden by a delete marker are included.
+func (c *Client) ListVersions(prefix string) ([]ObjectVersions, error) {
+	var out []ObjectVersions
+	idx := map[string]int{}
+	entry := func(key string) *ObjectVersions {
+		i, ok := idx[key]
+		if !ok {
+			i = len(out)
+			idx[key] = i
+			out = append(out, ObjectVersions{Key: key})
+		}
+		return &out[i]
+	}
+	keyMarker, versionMarker := "", ""
 	for {
 		q := url.Values{}
-		q.Set("list-type", "2")
+		q.Set("versions", "")
 		q.Set("prefix", prefix)
-		if token != "" {
-			q.Set("continuation-token", token)
+		if keyMarker != "" {
+			q.Set("key-marker", keyMarker)
+			q.Set("version-id-marker", versionMarker)
 		}
-		u := c.objectURL("", q)
-		resp, err := c.do(http.MethodGet, u, nil, nil)
+		resp, err := c.do(http.MethodGet, c.objectURL("", q), nil, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -189,18 +240,25 @@ func (c *Client) List(prefix string) ([]string, error) {
 			return nil, err
 		}
 		if resp.StatusCode/100 != 2 {
-			return nil, fmt.Errorf("s3 list %s: %s: %s", prefix, resp.Status, strings.TrimSpace(string(b)))
+			return nil, fmt.Errorf("s3 list versions %s: %s: %s", prefix, resp.Status, strings.TrimSpace(string(b)))
 		}
-		var lr listResult
+		var lr versionsResult
 		if err := xml.Unmarshal(b, &lr); err != nil {
-			return nil, fmt.Errorf("s3 list: parse: %w", err)
+			return nil, fmt.Errorf("s3 list versions: parse: %w", err)
 		}
-		for _, o := range lr.Contents {
-			keys = append(keys, o.Key)
+		for _, v := range lr.Versions {
+			entry(v.Key).Versions++
 		}
-		if !lr.IsTruncated || lr.NextContinuationToken == "" {
-			return keys, nil
+		for _, d := range lr.DeleteMarkers {
+			e := entry(d.Key)
+			e.DeleteMarkers++
+			if d.IsLatest {
+				e.Deleted = true
+			}
 		}
-		token = lr.NextContinuationToken
+		if !lr.IsTruncated || lr.NextKeyMarker == "" {
+			return out, nil
+		}
+		keyMarker, versionMarker = lr.NextKeyMarker, lr.NextVersionIDMarker
 	}
 }

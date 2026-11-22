@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/hanging-rock-llc/soc2-tf/internal/httpretry"
 )
 
 // Identity is the caller identity of the credentials that ran Terraform.
@@ -43,16 +45,18 @@ func CallerIdentity(creds Credentials, region string, hc *http.Client) (*Identit
 		endpoint = fmt.Sprintf("https://sts.%s.amazonaws.com/", region)
 	}
 	body := "Action=GetCallerIdentity&Version=2011-06-15"
-	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
-	Sign(req, creds, region, "sts", HashHex([]byte(body)), time.Now())
 	if hc == nil {
 		hc = &http.Client{Timeout: 15 * time.Second}
 	}
-	resp, err := hc.Do(req)
+	resp, err := httpretry.Do(hc, func() (*http.Request, error) {
+		req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+		Sign(req, creds, region, "sts", HashHex([]byte(body)), time.Now())
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
 	}

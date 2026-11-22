@@ -4,6 +4,7 @@
 package plan
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -44,25 +45,32 @@ type Facts struct {
 	// ChangesetDigest is a SHA-256 over the sorted list of non-no-op changes
 	// (address + normalized action). Two plans that would make the same
 	// changes have the same digest even if they were produced by different
-	// runs, which is what lets an apply-on-merge re-plan be matched to the
-	// plan that was reviewed on the pull request.
+	// runs. It says nothing about attribute values; see ValuesDigest.
 	ChangesetDigest string `json:"changeset_digest"`
-	JSONSHA256      string `json:"json_sha256"`
+	// ValuesDigest additionally covers each change's planned end state
+	// (`after`, `after_unknown`, `importing`). It is what lets an
+	// apply-on-merge re-plan be matched to the plan reviewed on the pull
+	// request: same resources, same actions, same resulting values. Prior
+	// state (`before`) is excluded so drift alone doesn't cause a mismatch.
+	ValuesDigest string `json:"values_digest,omitempty"`
+	JSONSHA256   string `json:"json_sha256"`
+}
+
+type rawChange struct {
+	Actions      []string        `json:"actions"`
+	After        json.RawMessage `json:"after"`
+	AfterUnknown json.RawMessage `json:"after_unknown"`
+	Importing    json.RawMessage `json:"importing"`
 }
 
 type rawPlan struct {
 	FormatVersion    string `json:"format_version"`
 	TerraformVersion string `json:"terraform_version"`
 	ResourceChanges  []struct {
-		Address string `json:"address"`
-		Change  struct {
-			Actions   []string        `json:"actions"`
-			Importing json.RawMessage `json:"importing"`
-		} `json:"change"`
+		Address string    `json:"address"`
+		Change  rawChange `json:"change"`
 	} `json:"resource_changes"`
-	OutputChanges map[string]struct {
-		Actions []string `json:"actions"`
-	} `json:"output_changes"`
+	OutputChanges map[string]rawChange `json:"output_changes"`
 }
 
 // Normalize collapses Terraform's action lists to one verb.
@@ -103,6 +111,24 @@ func Parse(data []byte) (*Facts, error) {
 		JSONSHA256:       hex.EncodeToString(sum[:]),
 		Changes:          []Change{},
 	}
+	var valueLines []string
+	addValues := func(c Change, rc rawChange) error {
+		if c.Action == "read" {
+			return nil
+		}
+		// One JSON array per change keeps the fields unambiguous even when an
+		// address contains separators.
+		tuple, err := json.Marshal([]any{c.Kind, c.Address, c.Action, orNull(rc.After), orNull(rc.AfterUnknown), orNull(rc.Importing)})
+		if err != nil {
+			return fmt.Errorf("parse plan json: %s: %w", c.Address, err)
+		}
+		line, err := canonical(tuple)
+		if err != nil {
+			return fmt.Errorf("parse plan json: %s: %w", c.Address, err)
+		}
+		valueLines = append(valueLines, line)
+		return nil
+	}
 	for _, rc := range rp.ResourceChanges {
 		a := Normalize(rc.Change.Actions)
 		importing := len(rc.Change.Importing) > 0 && string(rc.Change.Importing) != "null"
@@ -128,14 +154,22 @@ func Parse(data []byte) (*Facts, error) {
 		case "forget":
 			f.Summary.Forget++
 		}
-		f.Changes = append(f.Changes, Change{Address: rc.Address, Kind: "resource", Action: a, Actions: rc.Change.Actions})
+		c := Change{Address: rc.Address, Kind: "resource", Action: a, Actions: rc.Change.Actions}
+		if err := addValues(c, rc.Change); err != nil {
+			return nil, err
+		}
+		f.Changes = append(f.Changes, c)
 	}
 	for name, oc := range rp.OutputChanges {
 		a := Normalize(oc.Actions)
 		if a == "no-op" {
 			continue
 		}
-		f.Changes = append(f.Changes, Change{Address: "output." + name, Kind: "output", Action: a, Actions: oc.Actions})
+		c := Change{Address: "output." + name, Kind: "output", Action: a, Actions: oc.Actions}
+		if err := addValues(c, oc); err != nil {
+			return nil, err
+		}
+		f.Changes = append(f.Changes, c)
 	}
 	sort.Slice(f.Changes, func(i, j int) bool { return f.Changes[i].Address < f.Changes[j].Address })
 	f.HasChanges = false
@@ -146,7 +180,35 @@ func Parse(data []byte) (*Facts, error) {
 		}
 	}
 	f.ChangesetDigest = Digest(f.Changes)
+	sort.Strings(valueLines)
+	vh := sha256.Sum256([]byte(strings.Join(valueLines, "\n")))
+	f.ValuesDigest = hex.EncodeToString(vh[:])
 	return f, nil
+}
+
+func orNull(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage("null")
+	}
+	return raw
+}
+
+// canonical re-encodes a JSON value with sorted object keys and numbers kept
+// verbatim, so equal values always produce equal bytes.
+func canonical(raw []byte) (string, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(buf.String(), "\n"), nil
 }
 
 // Digest computes the changeset digest over changes that mutate something.

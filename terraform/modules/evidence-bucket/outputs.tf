@@ -15,12 +15,17 @@ output "kms_key_arn" {
 
 output "sink_uri" {
   description = "Value for tfproof's --sink / TFPROOF_SINK."
-  value       = "s3://${aws_s3_bucket.evidence.id}/tfproof"
+  value       = trimsuffix("s3://${aws_s3_bucket.evidence.id}/${var.evidence_prefix}", "/")
 }
 
-output "writer_policy_json" {
-  description = "IAM policy to attach to CI plan/apply roles so tfproof can write records."
-  value       = data.aws_iam_policy_document.writer.json
+output "plan_writer_policy_json" {
+  description = "IAM policy for the CI role that runs terraform plan: writes plan records and indexes."
+  value       = data.aws_iam_policy_document.plan_writer.json
+}
+
+output "apply_writer_policy_json" {
+  description = "IAM policy for the CI role that runs terraform apply: writes apply records and reads indexes to verify."
+  value       = data.aws_iam_policy_document.apply_writer.json
 }
 
 output "reader_policy_json" {
