@@ -36,7 +36,8 @@ Auditors typically pull the full population of production changes for the period
 
 - Branch protection and required-review settings themselves. Export these from GitHub (or your compliance platform) as configuration evidence.
 - Changes made outside CI (console click-ops), or applies from a workflow that doesn't run tfproof. Pair tfproof with drift detection and CloudTrail management-event monitoring so out-of-band changes surface as findings.
-- Records are hashed, not signed. Someone who can assume a CI role could add a fabricated record (they can't replace or delete an existing one). Restrict who can assume the apply role, ideally to the protected deployment environment.
+- Records are hashed, not signed. Someone who can assume a CI role could add a fabricated record (they can't replace or delete an existing one). Restrict the apply role's OIDC trust to a `production` environment that only `main` can deploy to.
+- Enforcing review. tfproof records and reports approvals; GitHub enforces them through branch protection (Pro, Team or Enterprise for private repos). Deploy-time approval through environment required reviewers is only available on public repos or GitHub Enterprise; without it, the PR review is the approval.
 - Code review quality. tfproof proves a qualified person approved; it can't prove they read carefully.
 
 ## Retention

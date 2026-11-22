@@ -312,7 +312,8 @@ func cmdCapture(phase record.Phase, args []string) error {
 	}
 
 	if phase == record.PhaseApply {
-		// Approvals: PR reviews plus deployment environment approvals.
+		// Approvals: PR reviews, plus deployment-environment approvals where
+		// the plan offers them (public repos, or GitHub Enterprise).
 		if gh != nil {
 			in := ghctx.ApprovalInput{PR: rec.PullRequest, Environment: run.Environment, Actor: run.Actor}
 			if n := prNumber(rec); n > 0 {
@@ -326,7 +327,7 @@ func cmdCapture(phase record.Phase, args []string) error {
 			if in.EnvApprovals, err = gh.EnvApprovals(run.Repository, run.RunID); err != nil {
 				rec.Warnings = append(rec.Warnings, "environment approvals lookup failed (needs actions: read): "+err.Error())
 			}
-			if run.Environment == "" {
+			if run.Environment == "" && len(in.EnvApprovals) > 0 {
 				rec.Warnings = append(rec.Warnings, "environment not set: approvals of any deployment environment in this run were counted (set the environment input)")
 			}
 			a := ghctx.Evaluate(in)
