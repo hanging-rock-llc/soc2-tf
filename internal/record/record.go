@@ -199,18 +199,13 @@ func Finalize(r *Record) ([]byte, error) {
 
 // VerifyContent checks a stored record's content hash against its bytes as
 // stored, so fields this version of tfproof doesn't know about are covered
-// too. Records stored pretty-printed (tfproof before compact storage) are
-// compacted first.
+// too. Any change to the bytes, including whitespace, breaks the hash.
 func VerifyContent(data []byte) (*Record, bool, error) {
 	var r Record
 	if err := json.Unmarshal(data, &r); err != nil {
 		return nil, false, err
 	}
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, data); err != nil {
-		return nil, false, err
-	}
-	b := buf.Bytes()
+	b := bytes.TrimSuffix(data, []byte("\n"))
 	loc := hashField.FindIndex(b)
 	if loc == nil {
 		return &r, false, nil

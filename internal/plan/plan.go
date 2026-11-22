@@ -52,7 +52,7 @@ type Facts struct {
 	// apply-on-merge re-plan be matched to the plan reviewed on the pull
 	// request: same resources, same actions, same resulting values. Prior
 	// state (`before`) is excluded so drift alone doesn't cause a mismatch.
-	ValuesDigest string `json:"values_digest,omitempty"`
+	ValuesDigest string `json:"values_digest"`
 	JSONSHA256   string `json:"json_sha256"`
 }
 

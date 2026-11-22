@@ -2,7 +2,6 @@ package record
 
 import (
 	"bytes"
-	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -53,20 +52,6 @@ func TestVerifyCoversFieldsUnknownToThisVersion(t *testing.T) {
 	injected := bytes.Replace(b, []byte(`{"schema"`), []byte(`{"approved_by_auditor":true,"schema"`), 1)
 	if _, ok, _ := VerifyContent(injected); ok {
 		t.Fatal("adding a field the struct doesn't know about must break the hash")
-	}
-}
-
-func TestVerifyAcceptsPrettyPrintedRecords(t *testing.T) {
-	b, err := Finalize(sample())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var pretty bytes.Buffer
-	if err := json.Indent(&pretty, b, "", "  "); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok, err := VerifyContent(pretty.Bytes()); err != nil || !ok {
-		t.Fatalf("pretty-printed record should verify: ok=%v err=%v", ok, err)
 	}
 }
 

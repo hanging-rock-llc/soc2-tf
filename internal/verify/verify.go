@@ -47,14 +47,10 @@ func load(s sink.Sink, key string) (*record.Record, error) {
 
 func boolp(b bool) *bool { return &b }
 
-// sameChanges compares the plan being applied with a recorded plan by
-// content: the values digest when both sides have one, else the change-set
-// digest (address + action only), which is noted as weaker.
-func sameChanges(f *plan.Facts, rec *record.PlanEvidence) (match bool, note string) {
-	if f.ValuesDigest != "" && rec.ValuesDigest != "" {
-		return f.ValuesDigest == rec.ValuesDigest, ""
-	}
-	return f.ChangesetDigest == rec.ChangesetDigest, "compared resources and actions only (recorded plan has no values digest)"
+// sameChanges reports whether the plan being applied would produce the same
+// resources, actions and resulting values as a recorded plan.
+func sameChanges(f *plan.Facts, rec *record.PlanEvidence) bool {
+	return f.ValuesDigest == rec.ValuesDigest
 }
 
 // Check runs every applicable check. It never returns an error for a
@@ -85,12 +81,8 @@ func Check(s sink.Sink, in Input) (*record.Verification, error) {
 				note("plan file differs from the plan captured earlier in this run")
 			}
 		case in.Facts != nil:
-			var weak string
-			match, weak = sameChanges(in.Facts, runRec.Plan)
+			match = sameChanges(in.Facts, runRec.Plan)
 			note("same-run check compared plan contents (no plan file hash available)")
-			if weak != "" {
-				note("same-run check %s", weak)
-			}
 			if !match {
 				note("planned changes differ from the plan captured earlier in this run")
 			}
@@ -135,11 +127,9 @@ func Check(s sink.Sink, in Input) (*record.Verification, error) {
 			if in.Facts == nil || prRec.Plan == nil {
 				match = false
 				note("no plan contents to compare with PR #%d", in.PR)
-			} else if same, weak := sameChanges(in.Facts, prRec.Plan); !same {
+			} else if !sameChanges(in.Facts, prRec.Plan) {
 				match = false
 				note("planned changes differ from the last plan reviewed on PR #%d", in.PR)
-			} else if weak != "" {
-				note("PR check %s", weak)
 			}
 			v.PullRequest = boolp(match)
 			if !match {
