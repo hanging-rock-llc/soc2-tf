@@ -31,6 +31,12 @@ variable "kms_key_arn" {
   default     = null
 }
 
+variable "create_signing_keys" {
+  description = "Create KMS keys (ECC_NIST_P256, SIGN_VERIFY) that tfproof uses to sign plan and apply records, and grant kms:Sign on them to the plan and apply writer policies."
+  type        = bool
+  default     = true
+}
+
 variable "glacier_transition_days" {
   description = "Move records to Glacier Instant Retrieval after this many days (null to disable)."
   type        = number

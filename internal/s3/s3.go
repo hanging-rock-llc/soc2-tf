@@ -262,3 +262,49 @@ func (c *Client) ListVersions(prefix string) ([]ObjectVersions, error) {
 		keyMarker, versionMarker = lr.NextKeyMarker, lr.NextVersionIDMarker
 	}
 }
+
+type listResult struct {
+	Contents []struct {
+		Key string `xml:"Key"`
+	} `xml:"Contents"`
+	IsTruncated           bool   `xml:"IsTruncated"`
+	NextContinuationToken string `xml:"NextContinuationToken"`
+}
+
+// List returns every key under prefix, in listing order (paginating as
+// needed via ListObjectsV2).
+func (c *Client) List(prefix string) ([]string, error) {
+	var out []string
+	token := ""
+	for {
+		q := url.Values{}
+		q.Set("list-type", "2")
+		q.Set("prefix", prefix)
+		if token != "" {
+			q.Set("continuation-token", token)
+		}
+		resp, err := c.do(http.MethodGet, c.objectURL("", q), nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode/100 != 2 {
+			return nil, fmt.Errorf("s3 list %s: %s: %s", prefix, resp.Status, strings.TrimSpace(string(b)))
+		}
+		var lr listResult
+		if err := xml.Unmarshal(b, &lr); err != nil {
+			return nil, fmt.Errorf("s3 list: parse: %w", err)
+		}
+		for _, o := range lr.Contents {
+			out = append(out, o.Key)
+		}
+		if !lr.IsTruncated || lr.NextContinuationToken == "" {
+			return out, nil
+		}
+		token = lr.NextContinuationToken
+	}
+}

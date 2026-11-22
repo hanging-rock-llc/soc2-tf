@@ -3,7 +3,9 @@
 package report
 
 import (
+	"crypto/ecdsa"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"path"
@@ -12,15 +14,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hanging-rock-llc/soc2-tf/internal/cloudtrail"
 	"github.com/hanging-rock-llc/soc2-tf/internal/record"
 	"github.com/hanging-rock-llc/soc2-tf/internal/sink"
 )
+
+// KeyResolver fetches a signing key's public half and canonical ARN
+// (kms.Client satisfies it).
+type KeyResolver interface {
+	PublicKey(keyID string) (*ecdsa.PublicKey, string, error)
+}
 
 // Options select records.
 type Options struct {
 	Repo  string // owner/repo; empty = all
 	Since time.Time
 	Until time.Time // exclusive
+	// SigningKeys, per phase, is the KMS key that must have signed every
+	// record of that phase. Phases without a key aren't checked.
+	SigningKeys map[record.Phase]string
+	Keys        KeyResolver
+}
+
+type signingKey struct {
+	arn string
+	pub *ecdsa.PublicKey
 }
 
 // Row is one applied change.
@@ -29,6 +47,10 @@ type Row struct {
 	Key        string
 	ContentOK  bool
 	Exceptions []string
+	// Calls are the AWS API calls the apply's role session made (set by
+	// JoinCloudTrail; CallsChecked tells "none found" from "not looked up").
+	Calls        []cloudtrail.Event
+	CallsChecked bool
 }
 
 // Result is the evaluated population.
@@ -40,8 +62,10 @@ type Result struct {
 	NoOpApplies int
 	PlanCount   int
 	// Integrity lists stored objects that were overwritten, deleted, could
-	// not be read, or whose key doesn't match their content.
+	// not be read, signed wrongly, or whose key doesn't match their content.
 	Integrity []string
+	// CloudTrail is true once JoinCloudTrail has run.
+	CloudTrail bool
 }
 
 // parseKey splits records/<phase>/<owner>/<repo>/<yyyy>/<mm>/<dd>/<id>.json.
@@ -73,6 +97,24 @@ func Build(s sink.Sink, opt Options) (*Result, error) {
 		objs = append(objs, o...)
 	}
 	res := &Result{Opt: opt}
+	keys := map[string]signingKey{}
+	for phase, id := range opt.SigningKeys {
+		if id == "" {
+			continue
+		}
+		if opt.Keys == nil {
+			return nil, fmt.Errorf("report: signing key for %s records given but no way to fetch public keys", phase)
+		}
+		pub, arn, err := opt.Keys.PublicKey(id)
+		if err != nil {
+			return nil, fmt.Errorf("report: %s signing key: %w", phase, err)
+		}
+		keys[string(phase)] = signingKey{arn: arn, pub: pub}
+	}
+	objects := make(map[string]sink.Object, len(objs))
+	for _, o := range objs {
+		objects[o.Key] = o
+	}
 	sinceDay := opt.Since.UTC().Truncate(24 * time.Hour)
 	for _, o := range objs {
 		k := o.Key
@@ -110,6 +152,11 @@ func Build(s sink.Sink, opt Options) (*Result, error) {
 		if string(r.Phase) != phase || r.Run.Repository != keyRepo || r.ID != id || r.CapturedAt.UTC().Format("2006-01-02") != day.Format("2006-01-02") {
 			integrity = append(integrity, "record key does not match its content")
 		}
+		if want, ok := keys[phase]; ok {
+			if f := checkSignature(s, objects, k, b, want); f != "" {
+				integrity = append(integrity, f)
+			}
+		}
 		for _, f := range integrity {
 			res.Integrity = append(res.Integrity, k+": "+f)
 		}
@@ -130,6 +177,34 @@ func Build(s sink.Sink, opt Options) (*Result, error) {
 		return res.Applies[i].Rec.CapturedAt.Before(res.Applies[j].Rec.CapturedAt)
 	})
 	return res, nil
+}
+
+// checkSignature returns a finding if the record's detached signature is
+// missing, rewritten, from another key, or doesn't verify.
+func checkSignature(s sink.Sink, objects map[string]sink.Object, key string, data []byte, want signingKey) string {
+	sigKey := record.SignatureKey(key)
+	o, ok := objects[sigKey]
+	if !ok || o.Deleted {
+		return "record not signed"
+	}
+	if o.Versions > 1 {
+		return fmt.Sprintf("signature overwritten (%d versions)", o.Versions)
+	}
+	b, err := s.Get(sigKey)
+	if err != nil {
+		return "signature unreadable: " + err.Error()
+	}
+	var sig record.Signature
+	if err := json.Unmarshal(b, &sig); err != nil {
+		return "signature unreadable: " + err.Error()
+	}
+	if sig.KeyID != want.arn {
+		return "signed by unexpected key " + sig.KeyID
+	}
+	if err := sig.Verify(data, want.pub); err != nil {
+		return "signature invalid: " + err.Error()
+	}
+	return ""
 }
 
 func exceptions(r *record.Record, contentOK bool) []string {
@@ -159,7 +234,8 @@ var csvHeader = []string{
 	"pr_number", "pr_url", "pr_author", "approved_by", "environment_approved_by",
 	"independent_approver", "approved_final_commit", "plan_verified",
 	"exit_code", "succeeded", "create", "update", "replace", "delete",
-	"changeset_digest", "role_session_name", "record_key", "content_hash_ok", "exceptions",
+	"changeset_digest", "role_session_name", "aws_api_calls", "aws_api_errors",
+	"record_key", "content_hash_ok", "exceptions",
 }
 
 // WriteCSV writes the change population, one row per apply.
@@ -198,10 +274,11 @@ func (res *Result) WriteCSV(w io.Writer) error {
 		if r.CloudIdentity != nil {
 			session = r.CloudIdentity.RoleSessionName
 		}
+		calls, callErrs := callCounts(row)
 		if err := cw.Write([]string{
 			r.CapturedAt.UTC().Format(time.RFC3339), r.Run.Repository, r.IaC.Workdir, record.UnitKey(r.IaC), r.ID, r.Run.RunURL, r.Run.Actor,
 			prNum, prURL, prAuthor, approved, envApproved, indep, head, verified,
-			exit, ok, c, u, rp, d, digest, session, row.Key, strconv.FormatBool(row.ContentOK),
+			exit, ok, c, u, rp, d, digest, session, calls, callErrs, row.Key, strconv.FormatBool(row.ContentOK),
 			strings.Join(row.Exceptions, "; "),
 		}); err != nil {
 			return err
@@ -251,6 +328,22 @@ func (res *Result) WriteMarkdown(w io.Writer, source string) error {
 	p("- Applies with exceptions: **%d**\n", len(ex))
 	if len(res.Integrity) > 0 {
 		p("- Evidence integrity findings: **%d**\n", len(res.Integrity))
+	}
+	if res.CloudTrail {
+		calls, errs, unmatched := 0, 0, 0
+		for _, row := range res.Applies {
+			if !row.CallsChecked || len(row.Calls) == 0 {
+				unmatched++
+			}
+			for _, e := range row.Calls {
+				calls++
+				if e.ErrorCode != "" {
+					errs++
+				}
+			}
+		}
+		p("- AWS API calls made by these applies (from CloudTrail, in `api-calls.csv`): **%d**, of which **%d** returned an error\n", calls, errs)
+		p("- Applies with no CloudTrail events for their role session: **%d**\n", unmatched)
 	}
 	p("\nEvery apply recorded by `tfproof capture apply` is listed in `changes.csv` with its pull request, approvers, the identity that ran it, and whether the applied plan matched the reviewed plan. Each row points to a JSON record in a write-once Object Lock bucket whose `content_sha256` can be recomputed independently. Applies made without tfproof (outside CI, or from a workflow that skips it) are not in this population; reconcile against CloudTrail.\n\n")
 	p("## Exceptions\n\n")

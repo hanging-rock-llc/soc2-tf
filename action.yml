@@ -7,11 +7,11 @@ branding:
 
 inputs:
   command:
-    description: "capture-plan, verify, capture-apply, or report"
+    description: "capture-plan, verify, capture-apply, report, publish-vanta, or publish-drata"
     required: true
   sink:
-    description: "Evidence store, e.g. s3://my-evidence-bucket/tfproof"
-    required: true
+    description: "Evidence store, e.g. s3://my-evidence-bucket/tfproof (all commands except publish-*)"
+    default: ""
   workdir:
     description: Terraform/OpenTofu root module directory
     default: "."
@@ -66,6 +66,36 @@ inputs:
   report-out-dir:
     description: "report: output directory"
     default: tfproof-evidence
+  kms-key-id:
+    description: "capture: KMS key (ID, ARN or alias) used to sign each record"
+    default: ""
+  report-cloudtrail:
+    description: "report: S3 location of CloudTrail logs, e.g. s3://trail-bucket/AWSLogs/{account}, to list each apply's AWS API calls"
+    default: ""
+  report-cloudtrail-regions:
+    description: "report: comma-separated regions whose CloudTrail logs to read (default: $AWS_REGION and us-east-1)"
+    default: ""
+  report-cloudtrail-bucket-region:
+    description: "report: region of the CloudTrail bucket (default: region)"
+    default: ""
+  report-plan-signing-key:
+    description: "report: KMS key ARN that must have signed every plan record"
+    default: ""
+  report-apply-signing-key:
+    description: "report: KMS key ARN that must have signed every apply record"
+    default: ""
+  publish-dir:
+    description: "publish: directory containing changes.csv and summary.md"
+    default: tfproof-evidence
+  vanta-document-id:
+    description: "publish-vanta: Vanta document ID to attach the evidence to"
+    default: ""
+  drata-workspace-id:
+    description: "publish-drata: Drata workspace ID"
+    default: ""
+  drata-evidence-id:
+    description: "publish-drata: Drata evidence library item ID"
+    default: ""
 
 outputs:
   record-id:
@@ -90,15 +120,112 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Set up Go
+    # Prefer a signed release binary over building from source: it's faster
+    # and lets us verify provenance instead of trusting whatever is checked
+    # out at github.action_ref. Only tags (or commit SHAs that resolve to a
+    # tag) have a matching release; branches like "main" fall through to the
+    # build-from-source steps below. All inputs reach the script only through
+    # env:, never by interpolating them into the script, so untrusted values
+    # can't inject shell commands.
+    - name: Fetch released binary
+      id: fetch
       if: env.TFPROOF_BIN == ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ACTION_REF: ${{ github.action_ref }}
+        ACTION_REPO: ${{ github.action_repository }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$ACTION_REPO" ]; then
+          # Local action (uses: ./), not fetched from a versioned repo.
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        repo="$ACTION_REPO"
+
+        # Resolve the ref the caller pinned to a release tag: either the ref
+        # is itself a tag with a release, or it's the commit SHA of one.
+        tag=""
+        if gh release view "$ACTION_REF" --repo "$repo" >/dev/null 2>&1; then
+          tag="$ACTION_REF"
+        elif [[ "$ACTION_REF" =~ ^[0-9a-f]{40}$ ]]; then
+          # The regex above guarantees ACTION_REF is plain hex, so it is safe
+          # inside the jq filter. Collect all matches, then take the first in
+          # bash (piping into head would SIGPIPE gh under pipefail).
+          tags=$(gh api "repos/$repo/tags" --paginate --jq ".[] | select(.commit.sha == \"$ACTION_REF\") | .name")
+          tag="${tags%%$'\n'*}"
+          if [ -n "$tag" ] && ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            tag=""
+          fi
+        fi
+        if [ -z "$tag" ]; then
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        case "$RUNNER_OS" in
+          Linux)   os=linux ;;
+          macOS)   os=darwin ;;
+          Windows) os=windows ;;
+          *)
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+            ;;
+        esac
+        case "$RUNNER_ARCH" in
+          X64)   arch=amd64 ;;
+          ARM64) arch=arm64 ;;
+          *)
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+            ;;
+        esac
+        ext=""
+        [ "$os" = "windows" ] && ext=".exe"
+        asset="tfproof_${os}_${arch}${ext}"
+
+        dl="$RUNNER_TEMP/tfproof-dl"
+        mkdir -p "$dl"
+        gh release download "$tag" --repo "$repo" --dir "$dl" --clobber \
+          --pattern "$asset" --pattern "checksums.txt"
+
+        checksum_line=$(grep -E "[[:space:]]${asset}\$" "$dl/checksums.txt" || true)
+        if [ -z "$checksum_line" ]; then
+          echo "::error title=tfproof::no checksum entry for $asset in release $tag" >&2
+          exit 1
+        fi
+        echo "$checksum_line" > "$dl/asset.sha256"
+        ( cd "$dl"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c asset.sha256
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 -c asset.sha256
+          else
+            echo "::error title=tfproof::no sha256 checksum tool available" >&2
+            exit 1
+          fi
+        )
+
+        gh attestation verify "$dl/$asset" --repo "$repo" \
+          --signer-workflow "$repo/.github/workflows/release.yml"
+
+        bin="$RUNNER_TEMP/tfproof${ext}"
+        cp "$dl/$asset" "$bin"
+        chmod +x "$bin"
+        echo "TFPROOF_BIN=$bin" >> "$GITHUB_ENV"
+        echo "found=true" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Go
+      if: env.TFPROOF_BIN == '' && steps.fetch.outputs.found != 'true'
       uses: actions/setup-go@v5
       with:
         go-version-file: ${{ github.action_path }}/go.mod
         cache: false
 
     - name: Build tfproof
-      if: env.TFPROOF_BIN == ''
+      if: env.TFPROOF_BIN == '' && steps.fetch.outputs.found != 'true'
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -136,12 +263,24 @@ runs:
         TFPROOF_SINCE: ${{ inputs.report-since }}
         TFPROOF_UNTIL: ${{ inputs.report-until }}
         TFPROOF_OUT_DIR: ${{ inputs.report-out-dir }}
+        TFPROOF_KMS_KEY_ID: ${{ inputs.kms-key-id }}
+        TFPROOF_CLOUDTRAIL: ${{ inputs.report-cloudtrail }}
+        TFPROOF_CLOUDTRAIL_REGIONS: ${{ inputs.report-cloudtrail-regions }}
+        TFPROOF_CLOUDTRAIL_BUCKET_REGION: ${{ inputs.report-cloudtrail-bucket-region }}
+        TFPROOF_PLAN_SIGNING_KEY: ${{ inputs.report-plan-signing-key }}
+        TFPROOF_APPLY_SIGNING_KEY: ${{ inputs.report-apply-signing-key }}
+        TFPROOF_DIR: ${{ inputs.publish-dir }}
+        TFPROOF_VANTA_DOCUMENT_ID: ${{ inputs.vanta-document-id }}
+        TFPROOF_DRATA_WORKSPACE_ID: ${{ inputs.drata-workspace-id }}
+        TFPROOF_DRATA_EVIDENCE_ID: ${{ inputs.drata-evidence-id }}
       run: |
         set -euo pipefail
         case "$CMD" in
-          capture-plan)  exec "$TFPROOF_BIN" capture plan ;;
-          capture-apply) exec "$TFPROOF_BIN" capture apply ;;
-          verify)        exec "$TFPROOF_BIN" verify ;;
-          report)        exec "$TFPROOF_BIN" report ;;
-          *) echo "::error title=tfproof::unknown command '$CMD' (want capture-plan, verify, capture-apply, report)"; exit 1 ;;
+          capture-plan)   exec "$TFPROOF_BIN" capture plan ;;
+          capture-apply)  exec "$TFPROOF_BIN" capture apply ;;
+          verify)         exec "$TFPROOF_BIN" verify ;;
+          report)         exec "$TFPROOF_BIN" report ;;
+          publish-vanta)  exec "$TFPROOF_BIN" publish vanta ;;
+          publish-drata)  exec "$TFPROOF_BIN" publish drata ;;
+          *) echo "::error title=tfproof::unknown command '$CMD' (want capture-plan, verify, capture-apply, report, publish-vanta, publish-drata)"; exit 1 ;;
         esac

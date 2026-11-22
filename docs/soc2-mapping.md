@@ -28,16 +28,17 @@ Auditors typically pull the full population of production changes for the period
 
 | What the auditor asks | tfproof evidence |
 |---|---|
-| Logs can't be altered or deleted | Records are written once (`If-None-Match`, enforced by the bucket policy) to an S3 Object Lock bucket (COMPLIANCE mode) with SHA-256 checksums. `tfproof report` flags any record with more than one version, a delete marker, or a `content_sha256` that doesn't match |
+| Logs can't be altered or deleted | Records are written once (`If-None-Match`, enforced by the bucket policy) to an S3 Object Lock bucket (COMPLIANCE mode) with SHA-256 checksums, and signed with a per-phase KMS key. `tfproof report` flags any record with more than one version, a delete marker, a `content_sha256` that doesn't match, or a missing or invalid signature |
 | Access to Terraform state is logged | `terraform/modules/state-audit-trail`: CloudTrail data events on every state object read and write, with log file validation |
-| Who wrote the evidence | The bucket policy lets only the CI roles add objects; the plan role can only write plan records and indexes, the apply role only apply records; nobody can delete them |
+| Who wrote the evidence | The bucket policy lets only the CI roles add objects; the plan role can only write and sign plan records and indexes, the apply role only apply records; nobody can delete them. Every signing call is in CloudTrail with the run's role session |
+| What did the change actually do in AWS | `tfproof report --cloudtrail`: `api-calls.csv` lists every AWS API call each apply's role session made, with errors; `changes.csv` has per-apply totals |
 
 ## What tfproof does not cover
 
-- Branch protection and required-review settings themselves. Export these from GitHub (or your compliance platform) as configuration evidence.
+- Branch protection and required-review settings themselves. Export these from GitHub or GitLab (or your compliance platform) as configuration evidence.
 - Changes made outside CI (console click-ops), or applies from a workflow that doesn't run tfproof. Pair tfproof with drift detection and CloudTrail management-event monitoring so out-of-band changes surface as findings.
-- Records are hashed, not signed. Someone who can assume a CI role could add a fabricated record (they can't replace or delete an existing one). Restrict the apply role's OIDC trust to a `production` environment that only `main` can deploy to.
-- Enforcing review. tfproof records and reports approvals; GitHub enforces them through branch protection (Pro, Team or Enterprise for private repos). Deploy-time approval through environment required reviewers is only available on public repos or GitHub Enterprise; without it, the PR review is the approval.
+- Fabricated records from someone who can assume a CI role. Signing ties each record to a role's KMS key, but whoever can assume the apply role can sign as it (they can't replace or delete an existing record). Restrict the apply role's OIDC trust to a `production` environment that only `main` can deploy to.
+- Enforcing review. tfproof records and reports approvals; the code host enforces them (GitHub branch protection on Pro, Team or Enterprise for private repos; GitLab approval rules on Premium). Deploy-time approval through environment required reviewers is only available on GitHub public repos or Enterprise, or GitLab Premium protected environments; without it, the PR/MR review is the approval.
 - Code review quality. tfproof proves a qualified person approved; it can't prove they read carefully.
 
 ## Retention

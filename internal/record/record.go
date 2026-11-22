@@ -4,9 +4,11 @@ package record
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
@@ -14,7 +16,7 @@ import (
 	"time"
 
 	"github.com/hanging-rock-llc/soc2-tf/internal/awsv4"
-	"github.com/hanging-rock-llc/soc2-tf/internal/ghctx"
+	"github.com/hanging-rock-llc/soc2-tf/internal/ci"
 	"github.com/hanging-rock-llc/soc2-tf/internal/plan"
 )
 
@@ -85,9 +87,9 @@ type Record struct {
 	CapturedAt    time.Time       `json:"captured_at"`
 	Tool          Tool            `json:"tool"`
 	IaC           IaC             `json:"iac"`
-	Run           ghctx.Run       `json:"run"`
-	PullRequest   *ghctx.PR       `json:"pull_request,omitempty"`
-	Approval      *ghctx.Approval `json:"approval,omitempty"`
+	Run           ci.Run          `json:"run"`
+	PullRequest   *ci.PR          `json:"pull_request,omitempty"`
+	Approval      *ci.Approval    `json:"approval,omitempty"`
 	CloudIdentity *awsv4.Identity `json:"cloud_identity,omitempty"`
 	Plan          *PlanEvidence   `json:"plan,omitempty"`
 	Apply         *ApplyEvidence  `json:"apply,omitempty"`
@@ -134,7 +136,7 @@ func UnitKey(iac IaC) string {
 }
 
 // NewID builds the record ID: <run_id>-<attempt>-<job>-<phase>-<unit>.
-func NewID(run ghctx.Run, phase Phase, unit string) string {
+func NewID(run ci.Run, phase Phase, unit string) string {
 	job := run.Job
 	if job == "" {
 		job = "job"
@@ -160,6 +162,40 @@ func RunIndexKey(repo, runID, unit string) string {
 // PRIndexKey points at the latest plan record for a unit on a PR.
 func PRIndexKey(repo string, pr int, unit string) string {
 	return path.Join("index", repo, "pr", fmt.Sprint(pr), unit, "plan.json")
+}
+
+// SignatureKey is where a record's detached signature is stored: next to
+// the record, as <id>.sig.
+func SignatureKey(recordKey string) string {
+	return strings.TrimSuffix(recordKey, ".json") + ".sig"
+}
+
+// Signature is a detached KMS signature over a record's stored bytes. It is
+// verifiable offline: `openssl dgst -sha256 -verify pub.pem -signature
+// sig.der record.json`.
+type Signature struct {
+	Algorithm    string `json:"algorithm"`     // ECDSA_SHA_256
+	KeyID        string `json:"key_id"`        // KMS key ARN
+	RecordSHA256 string `json:"record_sha256"` // hex SHA-256 of the record object
+	Signature    []byte `json:"signature"`     // DER-encoded ECDSA signature (base64 in JSON)
+}
+
+// NewSignature builds the sidecar for a record signed over its SHA-256.
+func NewSignature(record []byte, algorithm, keyARN string, sig []byte) Signature {
+	sum := sha256.Sum256(record)
+	return Signature{Algorithm: algorithm, KeyID: keyARN, RecordSHA256: hex.EncodeToString(sum[:]), Signature: sig}
+}
+
+// Verify checks the signature against the record bytes and public key.
+func (s Signature) Verify(record []byte, pub *ecdsa.PublicKey) error {
+	sum := sha256.Sum256(record)
+	if hex.EncodeToString(sum[:]) != s.RecordSHA256 {
+		return errors.New("signature is for different record bytes")
+	}
+	if !ecdsa.VerifyASN1(pub, sum[:], s.Signature) {
+		return errors.New("signature does not verify")
+	}
+	return nil
 }
 
 // compact encodes v as compact JSON without HTML escaping.

@@ -28,6 +28,16 @@ output "apply_writer_policy_json" {
   value       = data.aws_iam_policy_document.apply_writer.json
 }
 
+output "plan_signing_key_arn" {
+  description = "KMS key that signs plan records (--kms-key-id for capture plan, --plan-signing-key for report). Null when create_signing_keys is false."
+  value       = var.create_signing_keys ? aws_kms_key.signing["plan"].arn : null
+}
+
+output "apply_signing_key_arn" {
+  description = "KMS key that signs apply records (--kms-key-id for capture apply, --apply-signing-key for report). Null when create_signing_keys is false."
+  value       = var.create_signing_keys ? aws_kms_key.signing["apply"].arn : null
+}
+
 output "reader_policy_json" {
   description = "IAM policy for the report job and auditors."
   value       = data.aws_iam_policy_document.reader.json

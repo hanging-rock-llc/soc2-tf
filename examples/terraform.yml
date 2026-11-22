@@ -35,6 +35,9 @@ env:
   EVIDENCE: s3://acme-tf-evidence/tfproof
   PLAN_ROLE: arn:aws:iam::123456789012:role/gha-terraform-plan
   APPLY_ROLE: arn:aws:iam::123456789012:role/gha-terraform-apply
+  # evidence-bucket module outputs plan_signing_key_arn / apply_signing_key_arn
+  PLAN_SIGNING_KEY: arn:aws:kms:us-east-1:123456789012:key/plan-key-id
+  APPLY_SIGNING_KEY: arn:aws:kms:us-east-1:123456789012:key/apply-key-id
 
 concurrency:
   group: terraform-${{ github.ref }}
@@ -70,6 +73,7 @@ jobs:
           sink: ${{ env.EVIDENCE }}
           workdir: ${{ env.TF_WORKDIR }}
           plan-file: tfplan
+          kms-key-id: ${{ env.PLAN_SIGNING_KEY }}
 
       - name: Upload plan for the apply job
         if: github.event_name == 'push'
@@ -126,7 +130,7 @@ jobs:
           terraform apply -input=false -no-color tfplan 2>&1 | tee apply.log
           code=${PIPESTATUS[0]}
           echo "exit-code=$code" >> "$GITHUB_OUTPUT"
-          exit $code
+          exit "$code"
 
       - name: Record apply
         if: always() && steps.apply.outcome != 'skipped'
@@ -139,3 +143,4 @@ jobs:
           exit-code: ${{ steps.apply.outputs.exit-code || '1' }}
           log: ${{ env.TF_WORKDIR }}/apply.log
           environment: production
+          kms-key-id: ${{ env.APPLY_SIGNING_KEY }}

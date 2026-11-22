@@ -1,4 +1,4 @@
-package ghctx
+package ci
 
 import (
 	"testing"

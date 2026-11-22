@@ -6,15 +6,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hanging-rock-llc/soc2-tf/internal/ghctx"
+	"github.com/hanging-rock-llc/soc2-tf/internal/ci"
 )
 
 func sample() *Record {
 	r := &Record{
 		Schema: Schema, Phase: PhasePlan, CapturedAt: time.Date(2026, 11, 22, 1, 2, 3, 456, time.UTC),
-		Run:         ghctx.Run{Repository: "acme/infra", RunID: "1", RunAttempt: "1", Job: "plan"},
+		Run:         ci.Run{Repository: "acme/infra", RunID: "1", RunAttempt: "1", Job: "plan"},
 		IaC:         IaC{Binary: "tofu", Workdir: "envs/prod"},
-		PullRequest: &ghctx.PR{Number: 1, Title: "Fix <script> & other \"things\" \u2028"},
+		PullRequest: &ci.PR{Number: 1, Title: "Fix <script> & other \"things\" \u2028"},
 	}
 	r.ID = NewID(r.Run, r.Phase, UnitKey(r.IaC))
 	return r
