@@ -42,6 +42,10 @@ type Context struct {
 	// (GitHub pull_request, GitLab merge_request_event), i.e. its plan is
 	// what reviewers saw.
 	PlansPR bool
+	// Checkout is the directory the CI system checked the repository out
+	// into (GITHUB_WORKSPACE, CI_PROJECT_DIR); workdirs are recorded
+	// relative to it.
+	Checkout string
 }
 
 // API reads change-approval evidence from the code host for one repository
