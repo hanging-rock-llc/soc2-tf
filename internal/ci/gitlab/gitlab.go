@@ -42,7 +42,7 @@ func FromEnv() ci.Context {
 		Actor:       os.Getenv("GITLAB_USER_LOGIN"),
 		Environment: firstNonEmpty(os.Getenv("TFPROOF_ENVIRONMENT"), os.Getenv("CI_ENVIRONMENT_NAME")),
 	}
-	ctx := ci.Context{PlansPR: r.Event == "merge_request_event"}
+	ctx := ci.Context{PlansPR: r.Event == "merge_request_event", Checkout: os.Getenv("CI_PROJECT_DIR")}
 	if iid := os.Getenv("CI_MERGE_REQUEST_IID"); iid != "" {
 		fmt.Sscanf(iid, "%d", &ctx.EventPR)
 	}

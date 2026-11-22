@@ -186,8 +186,8 @@ func (c *common) api(run ci.Run) (ci.API, string) {
 }
 
 // iac describes the root module instance being planned or applied.
-func (c *common) iac() record.IaC {
-	return record.IaC{Binary: c.binary, Workdir: relWorkdir(c.workdir), Workspace: workspace(c.workdir), Stack: c.stack}
+func (c *common) iac(checkout string) record.IaC {
+	return record.IaC{Binary: c.binary, Workdir: relWorkdir(c.workdir, checkout), Workspace: workspace(c.workdir), Stack: c.stack}
 }
 
 // workspace returns the selected Terraform/OpenTofu workspace, or "" for
@@ -284,10 +284,10 @@ func (c *common) resolvePR(api ci.API, ctx ci.Context) (int, string) {
 
 // relWorkdir makes w relative to the CI checkout so records name the same
 // workdir wherever the runner put the repository.
-func relWorkdir(w string) string {
-	if ws := firstNonEmpty(os.Getenv("GITHUB_WORKSPACE"), os.Getenv("CI_PROJECT_DIR")); ws != "" {
+func relWorkdir(w, checkout string) string {
+	if checkout != "" {
 		if abs, err := filepath.Abs(w); err == nil {
-			if rel, err := filepath.Rel(ws, abs); err == nil {
+			if rel, err := filepath.Rel(checkout, abs); err == nil {
 				if rel = filepath.ToSlash(rel); rel != ".." && !strings.HasPrefix(rel, "../") {
 					return rel
 				}
@@ -339,7 +339,7 @@ func cmdCapture(phase record.Phase, args []string) error {
 		Phase:      phase,
 		CapturedAt: time.Now().UTC(),
 		Tool:       record.Tool{Name: "tfproof", Version: version},
-		IaC:        c.iac(),
+		IaC:        c.iac(ctx.Checkout),
 		Run:        run,
 	}
 	unit := record.UnitKey(rec.IaC)
@@ -553,7 +553,7 @@ func cmdVerify(args []string) error {
 		warning(run, warn)
 	}
 	in := verify.Input{
-		Repo: run.Repository, RunID: run.RunID, Unit: record.UnitKey(c.iac()),
+		Repo: run.Repository, RunID: run.RunID, Unit: record.UnitKey(c.iac(ctx.Checkout)),
 		FileHash: fileHash, Facts: facts, PR: prNum,
 		RequireSameRun: *requireSameRun, RequirePR: *requirePR,
 	}

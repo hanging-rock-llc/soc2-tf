@@ -34,7 +34,7 @@ func FromEnv() ci.Context {
 		TriggeringActor: os.Getenv("GITHUB_TRIGGERING_ACTOR"),
 		Environment:     os.Getenv("TFPROOF_ENVIRONMENT"),
 	}
-	ctx := ci.Context{PlansPR: r.Event == "pull_request"}
+	ctx := ci.Context{PlansPR: r.Event == "pull_request", Checkout: os.Getenv("GITHUB_WORKSPACE")}
 	ctx.EventPR, r.PRHeadSHA = prFromEvent()
 	if !ctx.PlansPR {
 		r.PRHeadSHA = ""
