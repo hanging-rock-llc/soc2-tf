@@ -1,7 +1,11 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
@@ -18,6 +22,73 @@ import (
 
 	"github.com/hanging-rock-llc/soc2-tf/internal/record"
 )
+
+// fakeKMS holds one real P-256 key per key ARN and answers Sign and
+// GetPublicKey like KMS (DER ECDSA over the given digest).
+func fakeKMS(t *testing.T, arns ...string) {
+	t.Helper()
+	privs := map[string]*ecdsa.PrivateKey{}
+	for _, a := range arns {
+		privs[a], _ = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]string
+		json.NewDecoder(r.Body).Decode(&in)
+		priv, ok := privs[in["KeyId"]]
+		if !ok {
+			http.Error(w, `{"__type":"NotFoundException"}`, http.StatusBadRequest)
+			return
+		}
+		switch r.Header.Get("X-Amz-Target") {
+		case "TrentService.Sign":
+			digest, _ := base64.StdEncoding.DecodeString(in["Message"])
+			sig, _ := ecdsa.SignASN1(rand.Reader, priv, digest)
+			json.NewEncoder(w).Encode(map[string]any{"KeyId": in["KeyId"], "Signature": sig})
+		case "TrentService.GetPublicKey":
+			der, _ := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+			json.NewEncoder(w).Encode(map[string]any{"KeyId": in["KeyId"], "PublicKey": der, "KeySpec": "ECC_NIST_P256", "KeyUsage": "SIGN_VERIFY"})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("TFPROOF_KMS_ENDPOINT", srv.URL)
+}
+
+func TestSignedRecords(t *testing.T) {
+	const planKey, applyKey = "arn:aws:kms:us-east-1:1:key/plan", "arn:aws:kms:us-east-1:1:key/apply"
+	dir, wd, s3 := e2eEnv(t)
+	fakeKMS(t, planKey, applyKey)
+	setRun(t, dir, "555", "push", "mergesha", `{"ref":"refs/heads/main"}`)
+	if err := run([]string{"capture", "plan", "--workdir", wd, "--plan-json", "plan.json", "--pr", "none", "--kms-key-id", planKey}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"capture", "apply", "--workdir", wd, "--plan-json", "plan.json", "--exit-code", "0", "--pr", "none", "--kms-key-id", applyKey}); err != nil {
+		t.Fatal(err)
+	}
+	sigs := 0
+	for k := range s3.objects {
+		if strings.HasSuffix(k, ".sig") {
+			sigs++
+		}
+	}
+	if sigs != 2 {
+		t.Fatalf("want a signature per record, objects: %v", keys(s3.objects))
+	}
+	out := filepath.Join(dir, "evidence")
+	report := func(plan, apply string) string {
+		t.Helper()
+		if err := run([]string{"report", "--since", "2000-01-01", "--out-dir", out, "--plan-signing-key", plan, "--apply-signing-key", apply}); err != nil {
+			t.Fatal(err)
+		}
+		md, _ := os.ReadFile(filepath.Join(out, "summary.md"))
+		return string(md)
+	}
+	if md := report(planKey, applyKey); strings.Contains(md, "sign") && strings.Contains(md, "integrity findings") {
+		t.Fatalf("correctly signed records flagged:\n%s", md)
+	}
+	if md := report(applyKey, planKey); !strings.Contains(md, "signed by unexpected key "+planKey) || !strings.Contains(md, "signed by unexpected key "+applyKey) {
+		t.Fatalf("swapped keys not flagged:\n%s", md)
+	}
+}
 
 // fakeS3 is a path-style, versioned S3 stand-in that enforces the things
 // tfproof relies on: signed requests, sha256 checksums and If-None-Match on
@@ -365,6 +436,96 @@ func TestPushPlanDoesNotReplaceReviewedPRPlan(t *testing.T) {
 	err := run([]string{"verify", "--workdir", wd, "--plan-json", "evil.json", "--plan-file", "tfplan", "--require-same-run", "--require-pr"})
 	if ee, ok := err.(exitError); !ok || ee.code != 2 {
 		t.Fatalf("main's plan differs from the one reviewed on PR #7; verify should exit 2, got %v", err)
+	}
+}
+
+func fakeGitLab(t *testing.T) *httptest.Server {
+	routes := map[string]string{
+		"/api/v4/projects/42/merge_requests/7": `{"iid":7,"web_url":"https://gitlab.com/acme/infra/-/merge_requests/7","title":"Add logs bucket",
+			"author":{"username":"alice"},"sha":"headsha","source_branch":"feature","target_branch":"main","state":"merged",
+			"merge_user":{"username":"bob"},"merge_commit_sha":"mergesha","created_at":"2026-11-20T09:00:00Z"}`,
+		"/api/v4/projects/42/repository/commits/mergesha/merge_requests": `[{"iid":7,"state":"merged","merge_commit_sha":"mergesha"}]`,
+		"/api/v4/projects/42/merge_requests/7/approvals":                 `{"approved_by":[{"user":{"username":"bob"},"approved_at":"2026-11-20T12:00:00Z"}]}`,
+		"/api/v4/projects/42/merge_requests/7/versions":                  `[{"head_commit_sha":"headsha","created_at":"2026-11-20T11:00:00Z"}]`,
+		"/api/v4/projects/42/events":                                     `[{"author":{"username":"alice"},"push_data":{"ref":"feature","ref_type":"branch"}}]`,
+		"/api/v4/projects/42/deployments":                                `[{"id":1,"deployable":{"id":902}}]`,
+		"/api/v4/projects/42/deployments/1":                              `{"id":1,"approvals":[{"user":{"username":"dave"},"status":"approved"}]}`,
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("PRIVATE-TOKEN") != "glpat-test" {
+			http.Error(w, "401", http.StatusUnauthorized)
+			return
+		}
+		body, ok := routes[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, body)
+	}))
+}
+
+func setGitLabJob(t *testing.T, dir, pipeline, job, source, sha, mr, env string) {
+	t.Helper()
+	for k, v := range map[string]string{
+		"GITLAB_CI": "true", "GITHUB_ACTIONS": "", "CI_PROJECT_ID": "42", "CI_PROJECT_PATH": "acme/infra", "CI_PROJECT_DIR": dir,
+		"CI_PIPELINE_ID": pipeline, "CI_JOB_ID": job, "CI_JOB_NAME": "tf", "CI_PIPELINE_SOURCE": source, "CI_COMMIT_SHA": sha,
+		"CI_MERGE_REQUEST_IID": mr, "CI_MERGE_REQUEST_SOURCE_BRANCH_SHA": "", "GITLAB_USER_LOGIN": "bob", "CI_ENVIRONMENT_NAME": env,
+		"TFPROOF_ENVIRONMENT": "",
+	} {
+		t.Setenv(k, v)
+	}
+}
+
+func TestGitLabFlow(t *testing.T) {
+	dir, wd, s3 := e2eEnv(t)
+	gl := fakeGitLab(t)
+	defer gl.Close()
+	t.Setenv("CI_API_V4_URL", gl.URL+"/api/v4")
+	t.Setenv("TFPROOF_GITLAB_TOKEN", "glpat-test")
+	t.Setenv("TFPROOF_NO_AWS_IDENTITY", "true")
+
+	// Merge request pipeline plans the MR.
+	setGitLabJob(t, dir, "500", "900", "merge_request_event", "headsha", "7", "")
+	if err := run([]string{"capture", "plan", "--workdir", wd, "--plan-json", "plan.json"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s3.current("tfproof/index/acme/infra/pr/7/infra__prod/plan.json"); !ok {
+		t.Fatalf("MR index not written; objects: %v", keys(s3.objects))
+	}
+	// Push pipeline on main: plan job, then apply job in production.
+	setGitLabJob(t, dir, "600", "901", "push", "mergesha", "", "")
+	if err := run([]string{"capture", "plan", "--workdir", wd, "--plan-json", "plan.json", "--plan-file", "tfplan"}); err != nil {
+		t.Fatal(err)
+	}
+	setGitLabJob(t, dir, "600", "902", "push", "mergesha", "", "production")
+	if err := run([]string{"verify", "--workdir", wd, "--plan-json", "plan.json", "--plan-file", "tfplan", "--require-same-run", "--require-pr"}); err != nil {
+		t.Fatalf("verify should pass: %v", err)
+	}
+	if err := run([]string{"verify", "--workdir", wd, "--plan-json", "evil.json", "--require-pr"}); err == nil {
+		t.Fatal("verify of a plan that differs from the MR's must fail")
+	}
+	if err := run([]string{"capture", "apply", "--workdir", wd, "--plan-json", "plan.json", "--plan-file", "tfplan", "--exit-code", "0"}); err != nil {
+		t.Fatal(err)
+	}
+	var rec *record.Record
+	for k := range s3.objects {
+		if strings.HasPrefix(k, "tfproof/records/apply/") {
+			b, _ := s3.current(k)
+			rec, _, _ = record.VerifyContent(b)
+		}
+	}
+	if rec == nil || rec.Run.Provider != "gitlab-ci" || rec.PullRequest == nil || rec.PullRequest.Author != "alice" {
+		t.Fatalf("apply record: %+v", rec)
+	}
+	a := rec.Approval
+	if a == nil || !a.ApprovedHead || !a.IndependentApprover || strings.Join(a.EnvironmentApprovedBy, ",") != "dave" || strings.Join(a.ChangeAuthors, ",") != "alice" {
+		b, _ := json.Marshal(a)
+		t.Fatalf("approval: %s (warnings %v)", b, rec.Warnings)
+	}
+	if v := rec.Apply.Verification; v == nil || !v.Passed || !strings.HasPrefix(v.PullRequestRecord, "500-900-") {
+		b, _ := json.Marshal(v)
+		t.Fatalf("verification: %s", b)
 	}
 }
 

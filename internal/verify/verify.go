@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/hanging-rock-llc/soc2-tf/internal/ci"
 	"github.com/hanging-rock-llc/soc2-tf/internal/plan"
 	"github.com/hanging-rock-llc/soc2-tf/internal/record"
 	"github.com/hanging-rock-llc/soc2-tf/internal/sink"
@@ -113,9 +114,9 @@ func Check(s sink.Sink, in Input) (*record.Verification, error) {
 		default:
 			v.PullRequestRecord = prRec.ID
 			match := true
-			if prRec.Run.Event != "pull_request" {
+			if !ci.PlansPREvent(prRec.Run.Provider, prRec.Run.Event) {
 				match = false
-				note("the PR #%d plan record was captured on a %q event, not pull_request", in.PR, prRec.Run.Event)
+				note("the PR #%d plan record was captured on a %q event, not one that plans the pull/merge request", in.PR, prRec.Run.Event)
 			}
 			switch {
 			case in.PRHeadSHA == "":

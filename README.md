@@ -85,7 +85,7 @@ permissions:
     sink: s3://acme-tf-evidence/tfproof
     workdir: infra/prod
     plan-file: tfplan
-
+    kms-key-id: arn:aws:kms:us-east-1:123456789012:key/…   # module.tf_evidence.plan_signing_key_arn
 # ...in the apply job, before terraform apply
 - uses: hanging-rock-llc/soc2-tf@<commit-sha>
   with:
@@ -107,6 +107,7 @@ permissions:
     exit-code: ${{ steps.apply.outputs.exit-code || '1' }}
     log: infra/prod/apply.log
     environment: production   # only approvals of this environment count
+    kms-key-id: arn:aws:kms:us-east-1:123456789012:key/…   # module.tf_evidence.apply_signing_key_arn
 ```
 
 Set `role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}` on `aws-actions/configure-aws-credentials` so each CloudTrail event traces back to a single run.
@@ -130,7 +131,9 @@ Deployment environments with **required reviewers** add a second, deploy-time ap
 
 ```bash
 tfproof report --sink s3://acme-tf-evidence/tfproof --repo acme/infra \
-  --since 2026-01-01 --until 2027-01-01 --out-dir evidence/
+  --since 2026-01-01 --until 2027-01-01 --out-dir evidence/ \
+  --plan-signing-key "$PLAN_KEY_ARN" --apply-signing-key "$APPLY_KEY_ARN" \
+  --cloudtrail 's3://acme-cloudtrail/AWSLogs/{account}'
 ```
 
 Or schedule it: [`examples/evidence-report.yml`](examples/evidence-report.yml).
@@ -141,15 +144,64 @@ Or schedule it: [`examples/evidence-report.yml`](examples/evidence-report.yml).
 - no approver independent of the change's authors (the PR author and everyone who authored or pushed its commits; bots don't count)
 - a PR approval on an older commit with no independent environment approval after it
 - a plan that wasn't verified against, or didn't match, the reviewed plan
-- a record whose content hash doesn't match, that was overwritten, or that is stored under the wrong key
+- a record whose content hash doesn't match, that was overwritten, that is stored under the wrong key, or (with signing keys given) that is unsigned, signed by the wrong key, or has an invalid signature
+
+## Signed records
+
+With `kms-key-id` set, each capture signs the record it stores (ECDSA P-256 via AWS KMS, `kms:Sign`) and writes the signature next to it as `<id>.sig`. The evidence-bucket module creates two keys, one per phase, and grants only the plan role the plan key and only the apply role the apply key. So a valid signature also shows which role wrote the record, and every signing call appears in CloudTrail with the CI run's role session.
+
+`tfproof report --plan-signing-key K --apply-signing-key K` fetches the public keys (`kms:GetPublicKey`) and flags any record that isn't signed by the right key. Signatures can also be checked offline with the public key and `openssl`; see [the record schema](docs/record-schema.md#checking-a-signature). This works on every GitHub plan and on GitLab. Anyone who can assume the apply role can still sign an apply record, so keep that role's trust policy tight.
+
+## AWS API calls (CloudTrail)
+
+`tfproof report --cloudtrail s3://<trail-bucket>/<path>/AWSLogs/{account}` reads the trail's log files from S3 and lists, for every apply, the AWS API calls its role session made, using the session ARN recorded in the apply. They go to `api-calls.csv`, with per-apply totals and error counts in `changes.csv`. `{account}` is replaced with each apply's account (organization trails: `…/AWSLogs/o-xxxx/{account}`).
+
+- `--cloudtrail-regions` lists the regions to read (default: `$AWS_REGION` and `us-east-1`, where global services like IAM log).
+- `--cloudtrail-lookback` (default `1h`) is how far before each apply record to look. Set it to at least the apply role's session duration.
+- The report role needs `s3:ListBucket` and `s3:GetObject` on the trail bucket (and `kms:Decrypt` if the trail is KMS-encrypted).
+
+This depends on unique role session names: set `role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}`.
+
+## Publishing to Vanta or Drata
+
+After `report`, push the evidence pack (`summary.md`, `changes.csv`, and `api-calls.csv` if present) to your compliance platform:
+
+```bash
+# Vanta: uploads to a document and submits it. Needs a Manage Vanta API application
+# with scopes vanta-api.all:read vanta-api.all:write vanta-api.documents:upload.
+VANTA_CLIENT_ID=… VANTA_CLIENT_SECRET=… tfproof publish vanta --dir evidence --document-id <document-id>
+
+# Drata: uploads the files and attaches them to an evidence item, replacing the
+# previous tfproof artifacts of the same name. TFPROOF_DRATA_API_URL selects the EU/APAC host.
+DRATA_API_KEY=… tfproof publish drata --dir evidence --workspace-id <n> --evidence-id <n>
+```
+
+In the action these are `command: publish-vanta` / `publish-drata`, with credentials in the step's `env:`.
+
+## GitLab CI
+
+The same binary works in GitLab CI; see [`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml).
+
+- **Merge requests:** it reads them through the API, which needs a project access token with `read_api` (Reporter) in `TFPROOF_GITLAB_TOKEN`; `CI_JOB_TOKEN` can't read approvals. Plans in `merge_request_event` pipelines are the reviewed plans.
+- **Approvals:** GitLab doesn't say which commit an approval was for, so tfproof attributes each one to the merge request head pushed before it was given. Change authors are the MR author plus everyone who pushed to its source branch (pushes in forks aren't visible).
+- **Deployment approvals:** collected from protected environments (Premium/Ultimate).
+- **Records:** `run_id` is the pipeline ID and `run_attempt` the job ID.
+
+## Action binaries
+
+Releases (`v*` tags) publish binaries for Linux, macOS and Windows with a checksum file and GitHub build-provenance attestations. When you pin the action to a release tag, or to the commit SHA of one, it downloads the matching binary, checks its SHA-256 and verifies its provenance with `gh attestation verify` before running it. Pinned to anything else, it builds from source.
 
 ## CLI
 
 ```
-tfproof capture plan   --sink S --workdir D (--plan-file F | --plan-json J) [--binary tofu] [--stack N]
+tfproof capture plan   --sink S --workdir D (--plan-file F | --plan-json J) [--binary tofu] [--stack N] [--kms-key-id K]
 tfproof verify         --sink S --workdir D --plan-file F [--stack N] [--require-same-run] [--require-pr] [--pr auto|N|none]
-tfproof capture apply  --sink S --workdir D --plan-file F --exit-code N [--stack N] [--log L] [--upload-log]
+tfproof capture apply  --sink S --workdir D --plan-file F --exit-code N [--stack N] [--log L] [--upload-log] [--kms-key-id K]
 tfproof report         --sink S [--repo owner/repo] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--out-dir D]
+                       [--plan-signing-key K] [--apply-signing-key K]
+                       [--cloudtrail s3://bucket/…/AWSLogs/{account}] [--cloudtrail-regions R,R] [--cloudtrail-lookback 1h]
+tfproof publish vanta  [--dir D] --document-id ID
+tfproof publish drata  [--dir D] --workspace-id N --evidence-id N
 ```
 
 Every flag has an environment-variable form (`--sink` → `TFPROOF_SINK`). The sink can be a local directory for trying it out:
@@ -168,7 +220,7 @@ AWS credentials come from the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_
 ## Docs
 
 - [SOC 2 control mapping](docs/soc2-mapping.md): what auditors ask for and which fields answer it
-- [Record schema](docs/record-schema.md): the record fields, the object layout, and how to verify a record by hand with `jq`
+- [Record schema](docs/record-schema.md): the record fields, the object layout, and how to check a record and its signature by hand
 - [Security](SECURITY.md)
 
 ## Supported workflows
@@ -181,15 +233,7 @@ AWS credentials come from the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_
 
 `pull_request_match` compares against the plan captured on a `pull_request` event for the PR's final commit. Require branches to be up to date before merging; otherwise main's plan includes changes the PR's plan didn't, and verification fails until the PR is re-planned.
 
-The action is a thin wrapper around the binary. Other CI systems can call the binary directly, but pull request and approval evidence is only collected inside GitHub Actions for now.
-
-## Roadmap
-
-- Join `report` with CloudTrail to show every AWS API call each apply made
-- Signed records via GitHub artifact attestations (Sigstore)
-- Release binaries so the action doesn't build from source
-- GitLab CI context
-- Push summaries to Vanta and Drata
+The action is a thin wrapper around the binary. On GitLab CI, call the binary directly (see above); other CI systems can too, but pull/merge request and approval evidence is only collected on GitHub Actions and GitLab CI.
 
 ## License
 

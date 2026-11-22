@@ -1,5 +1,5 @@
-# Example: build the auditor evidence pack monthly (or on demand) and attach
-# it to the run as an artifact.
+# Example: build the auditor evidence pack monthly (or on demand), attach it
+# to the run as an artifact, and push it to Vanta or Drata.
 name: tfproof evidence report
 
 on:
@@ -22,21 +22,46 @@ jobs:
   report:
     runs-on: ubuntu-latest
     steps:
+      # The reader role needs the evidence-bucket module's reader_policy_json
+      # (includes kms:GetPublicKey on the signing keys) plus read access to
+      # the CloudTrail bucket.
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::123456789012:role/gha-tfproof-reader
           aws-region: us-east-1
           role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - uses: hanging-rock-llc/soc2-tf@main
+      - uses: hanging-rock-llc/soc2-tf@main   # pin to a release tag or commit SHA
         with:
           command: report
           sink: s3://acme-tf-evidence/tfproof
           report-since: ${{ inputs.since }}
           report-until: ${{ inputs.until }}
+          # module.tf_evidence.plan_signing_key_arn / apply_signing_key_arn
+          report-plan-signing-key: arn:aws:kms:us-east-1:123456789012:key/plan-key-id
+          report-apply-signing-key: arn:aws:kms:us-east-1:123456789012:key/apply-key-id
+          report-cloudtrail: s3://acme-cloudtrail/AWSLogs/{account}
+          report-cloudtrail-regions: us-east-1,eu-west-1
 
       - uses: actions/upload-artifact@v4
         with:
           name: tfproof-evidence
           path: tfproof-evidence/
           retention-days: 90
+
+      # Pick the platform you use.
+      - uses: hanging-rock-llc/soc2-tf@main
+        with:
+          command: publish-vanta
+          vanta-document-id: infrastructure-change-management
+        env:
+          VANTA_CLIENT_ID: ${{ secrets.VANTA_CLIENT_ID }}
+          VANTA_CLIENT_SECRET: ${{ secrets.VANTA_CLIENT_SECRET }}
+
+      # - uses: hanging-rock-llc/soc2-tf@main
+      #   with:
+      #     command: publish-drata
+      #     drata-workspace-id: "1"
+      #     drata-evidence-id: "123"
+      #   env:
+      #     DRATA_API_KEY: ${{ secrets.DRATA_API_KEY }}

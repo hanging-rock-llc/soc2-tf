@@ -23,6 +23,27 @@ resource "aws_kms_alias" "evidence" {
   target_key_id = aws_kms_key.evidence[0].key_id
 }
 
+# Record signing keys: one per phase, so a valid signature also shows which
+# role wrote the record (only the plan role can use the plan key, only the
+# apply role the apply key). Keep these keys, or at least their public keys,
+# for as long as the records: signatures can't be checked without them.
+resource "aws_kms_key" "signing" {
+  for_each = var.create_signing_keys ? toset(["plan", "apply"]) : toset([])
+
+  description              = "tfproof ${each.key} record signing (${var.bucket_name})"
+  key_usage                = "SIGN_VERIFY"
+  customer_master_key_spec = "ECC_NIST_P256"
+  deletion_window_in_days  = 30
+  tags                     = var.tags
+}
+
+resource "aws_kms_alias" "signing" {
+  for_each = aws_kms_key.signing
+
+  name          = "alias/${var.bucket_name}-${each.key}-signing"
+  target_key_id = each.value.key_id
+}
+
 resource "aws_s3_bucket" "evidence" {
   bucket              = var.bucket_name
   object_lock_enabled = true
@@ -249,6 +270,15 @@ data "aws_iam_policy_document" "plan_writer" {
     actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
     resources = [local.kms_key_arn]
   }
+
+  dynamic "statement" {
+    for_each = var.create_signing_keys ? [aws_kms_key.signing["plan"].arn] : []
+    content {
+      sid       = "SignPlanRecords"
+      actions   = ["kms:Sign"]
+      resources = [statement.value]
+    }
+  }
 }
 
 # Attach to the CI role that runs `terraform apply` (ideally only assumable
@@ -278,6 +308,15 @@ data "aws_iam_policy_document" "apply_writer" {
     actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
     resources = [local.kms_key_arn]
   }
+
+  dynamic "statement" {
+    for_each = var.create_signing_keys ? [aws_kms_key.signing["apply"].arn] : []
+    content {
+      sid       = "SignApplyRecords"
+      actions   = ["kms:Sign"]
+      resources = [statement.value]
+    }
+  }
 }
 
 # Attach to the report job role and auditor roles.
@@ -298,5 +337,14 @@ data "aws_iam_policy_document" "reader" {
     sid       = "DecryptEvidence"
     actions   = ["kms:Decrypt"]
     resources = [local.kms_key_arn]
+  }
+
+  dynamic "statement" {
+    for_each = var.create_signing_keys ? [[for k in aws_kms_key.signing : k.arn]] : []
+    content {
+      sid       = "VerifySignatures"
+      actions   = ["kms:GetPublicKey"]
+      resources = statement.value
+    }
   }
 }

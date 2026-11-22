@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hanging-rock-llc/soc2-tf/internal/ghctx"
+	"github.com/hanging-rock-llc/soc2-tf/internal/ci"
 	"github.com/hanging-rock-llc/soc2-tf/internal/plan"
 	"github.com/hanging-rock-llc/soc2-tf/internal/record"
 	"github.com/hanging-rock-llc/soc2-tf/internal/sink"
@@ -28,7 +28,7 @@ func storePR(t *testing.T, s sink.Sink, runID, event, head string, f *plan.Facts
 	t.Helper()
 	r := &record.Record{
 		Schema: record.Schema, Phase: record.PhasePlan, CapturedAt: time.Now().UTC(),
-		Run:  ghctx.Run{Repository: "acme/infra", RunID: runID, RunAttempt: "1", Event: event, PRHeadSHA: head},
+		Run:  ci.Run{Provider: "github-actions", Repository: "acme/infra", RunID: runID, RunAttempt: "1", Event: event, PRHeadSHA: head},
 		Plan: &record.PlanEvidence{Facts: *f},
 	}
 	r.ID = record.NewID(r.Run, r.Phase, unit)
