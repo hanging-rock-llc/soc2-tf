@@ -6,7 +6,7 @@ If your Terraform already runs in GitHub Actions with OIDC and S3 state, you're 
 
 The usual way to get that is a Terraform Cloud-style platform priced for enterprises. `tfproof` is the missing piece by itself:
 
-- **Captures** every plan and apply as a JSON record: the change set, the PR, the reviewers, the deployment-environment approvers, the AWS role session that ran it, and the exit code.
+- **Captures** every plan and apply as a JSON record: the change set, the PR, the reviewers, any deployment-environment approvers, the AWS role session that ran it, and the exit code.
 - **Verifies** before apply that the plan being applied is byte-for-byte the plan from earlier in the run, and that its planned changes (resources, actions and resulting values) match the last plan of the pull request's final commit. If not, it fails the job.
 - **Stores** records write-once in **your** S3 bucket with Object Lock: a record can't be overwritten or deleted, and the report flags any record whose version history says otherwise.
 - **Reports**: one command produces the change population (`changes.csv`) and an exceptions summary (`summary.md`) for your auditor.
@@ -22,7 +22,7 @@ pull_request ─▶ terraform plan ─▶ tfproof capture-plan ─────�
                                                                      │   S3 (Object Lock)
 push to main ─▶ terraform plan ─▶ tfproof capture-plan ──────────────┤   records/…  index/…
                      │                                               │
-                     ▼  environment: production (required reviewers) │
+                     ▼  environment: production (main only)          │
                tfproof verify ──(fail = no apply)                    │
                terraform apply                                       │
                tfproof capture-apply ────────────────────────────────┘
@@ -69,14 +69,14 @@ module "state_audit" {
 
 ### 2. Add tfproof to your workflow
 
-See [`examples/terraform.yml`](examples/terraform.yml) for the full plan → gate → apply workflow. The essential parts:
+See [`examples/terraform.yml`](examples/terraform.yml) for the full plan → verify → apply workflow. The essential parts:
 
 ```yaml
 permissions:
   id-token: write
   contents: read
   pull-requests: read   # PR reviews
-  actions: read         # environment approvals
+  actions: read         # environment approvals, if your plan has them
 
 # ...after terraform plan -out=tfplan
 - uses: hanging-rock-llc/soc2-tf@<commit-sha>
@@ -112,6 +112,19 @@ permissions:
 Set `role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}` on `aws-actions/configure-aws-credentials` so each CloudTrail event traces back to a single run.
 
 Records are keyed by workdir and Terraform workspace. If one workdir is planned more than one way in the same run (for example once per var file), give each a distinct `stack:` so their plans aren't compared with each other.
+
+### Approvals
+
+The pull request review is the change approval. tfproof records who approved which commit and flags the apply if nobody independent of the change's authors approved its final commit. Make GitHub enforce the same thing with branch protection (or a ruleset) on `main`:
+
+- require at least one approving review
+- dismiss stale approvals when new commits are pushed
+- require approval of the most recent reviewable push (so whoever pushed last can't be the approver)
+- require branches to be up to date before merging
+
+Branch protection and rulesets on private repositories need GitHub Pro, Team or Enterprise. On GitHub Free with a private repo nothing stops an unreviewed merge; tfproof still records it and the report lists it as an exception.
+
+Deployment environments with **required reviewers** add a second, deploy-time approval, but GitHub only offers them on public repositories or with GitHub Enterprise. When present, tfproof records them, and an independent environment approval also covers a PR approval that went stale. Without them, use the `production` environment for its deployment-branch restriction (main only, available on Pro and Team) and for scoping the apply role's OIDC trust; leave the reviewers off.
 
 ### 3. Generate the evidence pack
 
@@ -162,9 +175,9 @@ AWS credentials come from the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_
 
 | Pattern | Verification |
 |---|---|
-| Plan job → environment gate → apply job in one run (recommended) | `same_run_match` (exact plan file) + `pull_request_match` (planned values) |
+| Plan job → apply job in one run, apply job in a `production` environment (recommended) | `same_run_match` (exact plan file) + `pull_request_match` (planned values) |
 | Plan and apply in one job after merge | `pull_request_match` |
-| `workflow_dispatch` / manual | Environment approvals; no PR, so verification relies on same-run plans |
+| `workflow_dispatch` / manual | No PR, so approval can only come from environment required reviewers (public repos or Enterprise); otherwise every manual apply is reported as unapproved. Verification relies on same-run plans |
 
 `pull_request_match` compares against the plan captured on a `pull_request` event for the PR's final commit. Require branches to be up to date before merging; otherwise main's plan includes changes the PR's plan didn't, and verification fails until the PR is re-planned.
 

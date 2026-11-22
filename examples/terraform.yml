@@ -1,15 +1,19 @@
-# Example: plan on pull requests, plan -> approval gate -> apply on merge,
+# Example: plan on pull requests, plan -> verify -> apply on merge,
 # with tfproof recording evidence at every step.
 #
 # Copy to .github/workflows/terraform.yml and adjust the env block.
 # Prereqs:
 #   - an evidence bucket (see terraform/modules/evidence-bucket)
 #   - GitHub OIDC roles: a read-only plan role (module output:
-#     plan_writer_policy_json) and an apply role assumable only from the
-#     "production" environment (module output: apply_writer_policy_json)
-#   - a "production" environment with required reviewers (Settings > Environments)
-#   - branch protection requiring branches to be up to date before merging, so
-#     main's plan matches the plan reviewed on the PR
+#     plan_writer_policy_json) and an apply role whose trust policy only
+#     allows the "production" environment (module output: apply_writer_policy_json)
+#   - a "production" environment whose deployment branches are limited to main
+#     (Settings > Environments). Required reviewers are optional: GitHub only
+#     offers them on public repos or with Enterprise.
+#   - branch protection on main: required approving review, dismiss stale
+#     approvals, require approval of the most recent push, and require
+#     branches to be up to date (so main's plan matches the plan reviewed on
+#     the PR)
 name: terraform
 
 on:
@@ -23,7 +27,7 @@ permissions:
   id-token: write       # OIDC to AWS
   contents: read
   pull-requests: read   # tfproof: PR metadata and reviews
-  actions: read         # tfproof: deployment environment approvals
+  actions: read         # tfproof: deployment environment approvals, if any
 
 env:
   TF_WORKDIR: infra/prod
@@ -79,7 +83,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: plan
     runs-on: ubuntu-latest
-    environment: production   # required reviewers approve here
+    environment: production   # main only; also gates on required reviewers if your plan has them
     steps:
       - uses: actions/checkout@v4
 
